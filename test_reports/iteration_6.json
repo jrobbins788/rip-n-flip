@@ -1,0 +1,69 @@
+{
+  "summary": "Day 12.5 testing complete — Verdict Engine math fix, 3-tier system, monetization gate, and robust fallback all working correctly. 21/21 backend tests pass. Frontend UI verified with Playwright.",
+  "backend_issues": {
+    "critical": [],
+    "minor": []
+  },
+  "frontend_issues": {
+    "ui_bugs": [],
+    "integration_issues": [],
+    "design_issues": []
+  },
+  "test_report_links": [
+    "/app/backend/tests/test_day12_5_verdict_math_monetization.py",
+    "/app/test_reports/pytest/pytest_results_iteration6.xml"
+  ],
+  "action_items": [],
+  "critical_code_review_comments": [
+    "Three-tier system correctly implemented: TIER1_MAX=50, TIER2_MAX=200, no TIER3_HARD",
+    "Verdict math uses normalized ratios: market_perf = ebay_avg/MSRP, internal_perf = actual_hit_rate/expected_baseline",
+    "When pack_cost_source='msrp_fallback', market_perf correctly defaults to 1.0 (neutral)",
+    "Verdict thresholds correct: final_score >= 1.05 → DUB, >= 0.70 → MID, < 0.70 → TRASH",
+    "Monetization gate working: free tier gets 403 after 2 packs/week with correct error shape",
+    "Pro users and trial users have unlimited access",
+    "ConfidenceBadge shows 3 dots (not 4) based on tier",
+    "IntelligencePanel shows Market perf, Hit-rate perf, Final score ratios"
+  ],
+  "updated_files": [
+    "/app/backend/tests/test_day12_5_verdict_math_monetization.py"
+  ],
+  "success_rate": {
+    "backend": "100% (21/21 tests passed)",
+    "frontend": "100% (all UI elements verified)"
+  },
+  "test_credentials": "admin@flipnrip.com / AdminPass123!",
+  "seed_data_creation": "Test users created with TEST_ prefix during testing, cleaned up after",
+  "retest_needed": false,
+  "should_main_agent_self_test": false,
+  "context_for_next_testing_agent": "Day 12.5 features fully tested: (1) GET /api/analyzer/{pack_id} returns verdict with intelligence block containing confidence.{tier,label,market_weight,pull_weight}, market_perf, internal_perf, final_score, expected_hit_rate_baseline. (2) Three-tier system: Tier 1 (<50 pulls) = Market Only 100/0, Tier 2 (50-200) = Market Verified 80/20, Tier 3 (>=200) = Community Hardened 50/50. (3) Verdict math: market_perf=1.0 on msrp_fallback (neutral), final_score drives rating (>=1.05 DUB, >=0.70 MID, <0.70 TRASH). (4) Monetization gate: free tier 403 after 2 packs/week with error='free_tier_limit', message contains 'Go Pro to Unlock', cta_url='/vault'. (5) Frontend: ConfidenceBadge shows 3 dots, IntelligencePanel shows perf ratios, paywall renders on 403 with GO PRO button.",
+  "features_tested": {
+    "verdict_math_fix": {
+      "status": "PASS",
+      "notes": "market_perf and internal_perf are unitless ratios. final_score = weighted blend. Neutral baseline (msrp_fallback) gives MID, not TRASH."
+    },
+    "three_tier_system": {
+      "status": "PASS",
+      "notes": "TIER1_MAX=50, TIER2_MAX=200. Tier 3 'Community Hardened' at >=200 pulls with 50/50 weights."
+    },
+    "monetization_gate": {
+      "status": "PASS",
+      "notes": "Free tier limited to 2 packs/week. 403 response has correct shape with error, message, cta_url, limit, used fields."
+    },
+    "robust_fallback": {
+      "status": "PASS",
+      "notes": "All 8 hot packs return 200, never 500. Invalid pack returns 404."
+    },
+    "confidence_badge_ui": {
+      "status": "PASS",
+      "notes": "Shows 3 dots (not 4) filled based on tier. Tier 1 = 1 dot filled."
+    },
+    "intelligence_panel_ui": {
+      "status": "PASS",
+      "notes": "Shows Market perf, Hit-rate perf, Final score when final_score is present."
+    },
+    "paywall_ui": {
+      "status": "PASS",
+      "notes": "Renders analyzer-paywall element on 403 with 'GO PRO TO UNLOCK' button and usage counter."
+    }
+  }
+}

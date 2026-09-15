@@ -1,0 +1,77 @@
+{
+  "name": "Rip N' Flip — Rip. Chase. Flip. Repeat.",
+  "short_name": "Rip N' Flip",
+  "description": "The obsessed sports card collector's command center. Pack Analyzer, Predictor, Display Case + Marketplace.",
+  "start_url": "/",
+  "scope": "/",
+  "display": "standalone",
+  "orientation": "portrait-primary",
+  "background_color": "#050505",
+  "theme_color": "#00F0FF",
+  "categories": ["sports", "lifestyle", "shopping", "entertainment"],
+  "lang": "en-US",
+  "dir": "ltr",
+  "prefer_related_applications": false,
+  "icons": [
+    {
+      "src": "/icon-192.png",
+      "sizes": "192x192",
+      "type": "image/png",
+      "purpose": "any"
+    },
+    {
+      "src": "/icon-384.png",
+      "sizes": "384x384",
+      "type": "image/png",
+      "purpose": "any"
+    },
+    {
+      "src": "/icon-512.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "any"
+    },
+    {
+      "src": "/icon-maskable-192.png",
+      "sizes": "192x192",
+      "type": "image/png",
+      "purpose": "maskable"
+    },
+    {
+      "src": "/icon-maskable-512.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "maskable"
+    }
+  ],
+  "shortcuts": [
+    {
+      "name": "Pack Analyzer",
+      "short_name": "Analyzer",
+      "description": "Get the verdict on a pack — DUB, MID, or TRASH",
+      "url": "/analyzer",
+      "icons": [{ "src": "/icon-192.png", "sizes": "192x192" }]
+    },
+    {
+      "name": "Pack Predictor",
+      "short_name": "Predict",
+      "description": "Simulate the rip with animated card reveals",
+      "url": "/predictor",
+      "icons": [{ "src": "/icon-192.png", "sizes": "192x192" }]
+    },
+    {
+      "name": "Display Case",
+      "short_name": "Binder",
+      "description": "Track every pack you've ripped",
+      "url": "/case",
+      "icons": [{ "src": "/icon-192.png", "sizes": "192x192" }]
+    },
+    {
+      "name": "Marketplace",
+      "short_name": "Market",
+      "description": "Buy, sell, and trade cards",
+      "url": "/marketplace",
+      "icons": [{ "src": "/icon-192.png", "sizes": "192x192" }]
+    }
+  ]
+}

@@ -1,0 +1,143 @@
+{
+  "summary": "Day 16 testing complete — Dethrone 'Heart Attack' Nudge (Web Push + In-app) feature fully tested. All 73 backend tests pass (Day 13-16 combined). Frontend verified with Playwright: PushOptInButton visible on /case, DethroneBanner component mounted, service worker has push handlers.",
+  "backend_issues": {
+    "critical": [],
+    "minor": []
+  },
+  "frontend_issues": {
+    "ui_bugs": [],
+    "integration_issues": [],
+    "design_issues": []
+  },
+  "test_report_links": [
+    "/app/backend/tests/test_day16_dethrone_push.py",
+    "/app/backend/tests/test_day15_refactor_battle_cta_webhook.py",
+    "/app/backend/tests/test_day14_predictor_rip_dub_streak.py",
+    "/app/backend/tests/test_day13_leaderboard_stripe_refactor.py",
+    "/app/test_reports/pytest/pytest_results_iteration10.xml"
+  ],
+  "action_items": [],
+  "critical_code_review_comments": [
+    "VAPID keys properly configured in backend/.env — public key starts with 'B' (uncompressed EC point), ~88 chars",
+    "GET /api/push/vapid-public-key returns {vapid_public_key, enabled: true} — public endpoint",
+    "POST /api/push/subscribe requires auth, accepts {endpoint, keys: {p256dh, auth}, user_agent}, idempotent upsert by (user_id, endpoint)",
+    "POST /api/push/unsubscribe requires auth, accepts {endpoint}, returns {unsubscribed: true|false}",
+    "GET /api/notifications requires auth (401 without), returns {notifications: [...], unread_count: N}, supports only_unread=true and limit params",
+    "POST /api/notifications/{id}/read requires auth, marks notification read, 404 if not found or belongs to another user",
+    "POST /api/notifications/read-all requires auth, marks all user's notifications read, returns {updated: N}",
+    "services/dethrone.py check_for_dethrone() called after successful upvote in routes/social.py line ~285-290",
+    "Dethrone notification body matches verbatim: 'You just lost the crown to @USERNAME. Beat them by Sunday or it's their Pro extension! 👑'",
+    "crown_state collection tracks weekly #1 holder, bootstraps on first vote of week without firing notification",
+    "Service worker /sw.js has 'push' and 'notificationclick' event handlers (verified via GET /sw.js)",
+    "Frontend DethroneBanner component polls /api/notifications every 60s, shows red gradient banner on dethrone notification",
+    "Frontend PushOptInButton visible on /case page next to ADD A PACK button (data-testid='push-opt-in-btn' or 'push-status-granted')",
+    "Anonymous users on /case see login prompt, no PushOptInButton or DethroneBanner visible",
+    "Regression: Battle CTA, privacy enforcement, thumbs voting, subscription endpoints all working"
+  ],
+  "updated_files": [
+    "/app/backend/tests/test_day16_dethrone_push.py"
+  ],
+  "success_rate": {
+    "backend": "100% (73/73 tests passed - Day 13-16 combined)",
+    "frontend": "100% (all UI elements verified)"
+  },
+  "test_credentials": "admin@flipnrip.com / AdminPass123! (role='admin' set in db.users, email in ADMIN_EMAILS env var)",
+  "seed_data_creation": "Test users created with TEST_dethrone_ prefix during testing, cleaned up after each test",
+  "retest_needed": false,
+  "should_main_agent_self_test": false,
+  "context_for_next_testing_agent": "Day 16 Dethrone 'Heart Attack' Nudge feature fully tested: (1) VAPID keys configured and working — GET /api/push/vapid-public-key returns valid key starting with 'B'. (2) Push subscribe/unsubscribe endpoints require auth, idempotent upsert. (3) Notifications API: GET /api/notifications (auth required, supports only_unread + limit), POST /api/notifications/{id}/read (404 for wrong user), POST /api/notifications/read-all. (4) Dethrone detection: services/dethrone.py check_for_dethrone() called after upvote, compares weekly top-1 vs crown_state, fires notification on change with verbatim copy. (5) Service worker has push + notificationclick handlers. (6) Frontend: DethroneBanner polls notifications, PushOptInButton on /case page. (7) All 73 backend tests pass (Day 13-16). Note: Web Push fan-out to real endpoints not tested (no real browser subscriptions in test env) — in-app notification creation verified.",
+  "features_tested": {
+    "vapid_public_key": {
+      "status": "PASS",
+      "notes": "GET /api/push/vapid-public-key returns valid key starting with 'B', ~88 chars, enabled=true"
+    },
+    "push_subscribe_auth": {
+      "status": "PASS",
+      "notes": "POST /api/push/subscribe returns 401 without auth"
+    },
+    "push_subscribe_with_auth": {
+      "status": "PASS",
+      "notes": "With auth, accepts subscription and returns {subscribed: true}"
+    },
+    "push_subscribe_idempotent": {
+      "status": "PASS",
+      "notes": "Re-posting same (user_id, endpoint) upserts, not duplicates"
+    },
+    "push_unsubscribe_auth": {
+      "status": "PASS",
+      "notes": "POST /api/push/unsubscribe returns 401 without auth"
+    },
+    "push_unsubscribe_with_auth": {
+      "status": "PASS",
+      "notes": "With auth, removes subscription and returns {unsubscribed: true|false}"
+    },
+    "notifications_auth": {
+      "status": "PASS",
+      "notes": "GET /api/notifications returns 401 without auth"
+    },
+    "notifications_list": {
+      "status": "PASS",
+      "notes": "With auth, returns {notifications: [...], unread_count: N}"
+    },
+    "notifications_only_unread_filter": {
+      "status": "PASS",
+      "notes": "Supports only_unread=true query param"
+    },
+    "notification_mark_read_auth": {
+      "status": "PASS",
+      "notes": "POST /api/notifications/{id}/read returns 401 without auth"
+    },
+    "notification_mark_read_404": {
+      "status": "PASS",
+      "notes": "Returns 404 for non-existent notification or wrong user"
+    },
+    "notification_read_all_auth": {
+      "status": "PASS",
+      "notes": "POST /api/notifications/read-all returns 401 without auth"
+    },
+    "notification_read_all_with_auth": {
+      "status": "PASS",
+      "notes": "With auth, marks all notifications read and returns {updated: N}"
+    },
+    "dethrone_infrastructure": {
+      "status": "PASS",
+      "notes": "Leaderboard, battle-cta, crown_state all working for dethrone detection"
+    },
+    "service_worker_push_handler": {
+      "status": "PASS",
+      "notes": "GET /sw.js contains addEventListener('push')"
+    },
+    "service_worker_notificationclick_handler": {
+      "status": "PASS",
+      "notes": "GET /sw.js contains addEventListener('notificationclick')"
+    },
+    "frontend_push_opt_in_button": {
+      "status": "PASS",
+      "notes": "PushOptInButton visible on /case page with data-testid='push-opt-in-btn'"
+    },
+    "frontend_dethrone_banner": {
+      "status": "PASS",
+      "notes": "DethroneBanner component mounted, not visible without dethrone notification (expected)"
+    },
+    "frontend_anonymous_user_case": {
+      "status": "PASS",
+      "notes": "Anonymous users see login prompt on /case, no push button or banner"
+    },
+    "regression_battle_cta": {
+      "status": "PASS",
+      "notes": "GET /api/binders/public/{user_id}/battle-cta still works"
+    },
+    "regression_privacy": {
+      "status": "PASS",
+      "notes": "GET /api/binders/public/* still enforces privacy (no case_pack_id)"
+    },
+    "regression_thumbs": {
+      "status": "PASS",
+      "notes": "POST /api/case/pulls/{id}/thumbs still returns {thumbs_up_count, your_vote}"
+    },
+    "regression_subscription": {
+      "status": "PASS",
+      "notes": "GET /api/subscription/status still works"
+    }
+  }
+}

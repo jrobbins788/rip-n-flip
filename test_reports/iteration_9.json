@@ -1,0 +1,147 @@
+{
+  "summary": "Day 15 testing complete — Backend refactor (subscription + social routes extracted to modules), Battle CTA endpoint, Stripe webhook hardening, and APScheduler all working correctly. 53/53 backend tests pass. Frontend UI verified with Playwright.",
+  "backend_issues": {
+    "critical": [],
+    "minor": []
+  },
+  "frontend_issues": {
+    "ui_bugs": [],
+    "integration_issues": [],
+    "design_issues": []
+  },
+  "test_report_links": [
+    "/app/backend/tests/test_day15_refactor_battle_cta_webhook.py",
+    "/app/backend/tests/test_day13_leaderboard_stripe_refactor.py",
+    "/app/backend/tests/test_day14_predictor_rip_dub_streak.py",
+    "/app/test_reports/pytest/pytest_results_iteration9.xml"
+  ],
+  "action_items": [],
+  "critical_code_review_comments": [
+    "Backend refactor successful: subscription routes moved to routes/subscription.py, social routes moved to routes/social.py",
+    "core.py enhanced with get_current_user (supports both Emergent OAuth sessions + JWT), is_admin, require_admin helpers",
+    "APScheduler running: logs show 'APScheduler started — DUB STREAK weekly award fires Mondays 00:05 UTC'",
+    "NEW /api/binders/public/{user_id}/battle-cta returns {is_champion, rank, thumbs_week, top_thumbs, crown_holder}",
+    "Top-3 weekly thumbs-up users correctly return is_champion=true, users outside top-3 return is_champion=false",
+    "Stripe webhook hardening: lenient mode (default) accepts valid JSON with invalid signature (verified=false), strict mode (STRIPE_WEBHOOK_STRICT=true) returns 400 on signature mismatch",
+    "Webhook bad JSON / empty body correctly returns 400 with error='bad_json'",
+    "Privacy enforced: /api/binders/public/{user_id} returns pulls WITHOUT case_pack_id, pack_type_id; source_pack='—'",
+    "All subscription endpoints functional: /checkout (returns cs_test_ URL), /status (tier+trial info), /cancel (requires active sub), /admin/info (admin-only), /webhook-mode (admin-only diagnostic)",
+    "Frontend BattleChampionBanner renders correctly for champion users with 'THIS WEEK'S CROWN HOLDER' label and 'Beat their X thumbs this week to take the crown' copy",
+    "DUB STREAK leaderboard on /binders page works with period toggle (week/all) and flame icon on #1",
+    "Login flow works: admin@flipnrip.com / AdminPass123! → redirects to /vault with JWT cookie"
+  ],
+  "updated_files": [
+    "/app/backend/tests/test_day15_refactor_battle_cta_webhook.py"
+  ],
+  "success_rate": {
+    "backend": "100% (53/53 tests passed)",
+    "frontend": "100% (all UI elements verified)"
+  },
+  "test_credentials": "admin@flipnrip.com / AdminPass123! (role='admin' set in db.users, email in ADMIN_EMAILS env var)",
+  "seed_data_creation": "Test users created with TEST_ prefix during testing, cleaned up after each test",
+  "retest_needed": false,
+  "should_main_agent_self_test": false,
+  "context_for_next_testing_agent": "Day 15 features fully tested: (1) Backend refactor complete — subscription routes in routes/subscription.py, social routes in routes/social.py, core.py has shared auth helpers. (2) APScheduler running for DUB STREAK weekly awards (Mondays 00:05 UTC). (3) NEW /api/binders/public/{user_id}/battle-cta returns champion info for top-3 weekly thumbs-up users. (4) Stripe webhook hardening: lenient mode (default) verifies signature but falls back to JSON parse on mismatch; strict mode (STRIPE_WEBHOOK_STRICT=true) returns 400 on mismatch. (5) Frontend BattleChampionBanner appears on champion binders with correct copy. (6) All 53 backend tests pass including Day 13, 14, and 15 test suites.",
+  "features_tested": {
+    "subscription_checkout": {
+      "status": "PASS",
+      "notes": "POST /api/subscription/checkout requires auth, returns Stripe cs_test_ URL"
+    },
+    "subscription_status": {
+      "status": "PASS",
+      "notes": "GET /api/subscription/status returns tier, trial_days_left, subscription_status"
+    },
+    "subscription_cancel": {
+      "status": "PASS",
+      "notes": "POST /api/subscription/cancel requires auth"
+    },
+    "subscription_admin_info": {
+      "status": "PASS",
+      "notes": "GET /api/subscription/admin/info admin-only, returns price_id"
+    },
+    "subscription_webhook_mode": {
+      "status": "PASS",
+      "notes": "GET /api/subscription/webhook-mode admin-only, returns secret_configured=true, strict_mode=false"
+    },
+    "binders_public_list": {
+      "status": "PASS",
+      "notes": "GET /api/binders/public returns gallery list"
+    },
+    "binders_public_single_user": {
+      "status": "PASS",
+      "notes": "GET /api/binders/public/{user_id} returns binder with privacy enforced (no case_pack_id)"
+    },
+    "binders_public_nonexistent_404": {
+      "status": "PASS",
+      "notes": "Non-existent user returns 404"
+    },
+    "visibility_toggle_auth": {
+      "status": "PASS",
+      "notes": "PATCH /api/case/packs/{id}/visibility requires auth"
+    },
+    "thumbs_vote_auth": {
+      "status": "PASS",
+      "notes": "POST /api/case/pulls/{id}/thumbs requires auth"
+    },
+    "thumbs_get_public": {
+      "status": "PASS",
+      "notes": "GET /api/case/pulls/{id}/thumbs is public"
+    },
+    "battle_cta_returns_champion_info": {
+      "status": "PASS",
+      "notes": "GET /api/binders/public/{user_id}/battle-cta returns {is_champion, rank, thumbs_week, top_thumbs, crown_holder}"
+    },
+    "battle_cta_nonexistent_404": {
+      "status": "PASS",
+      "notes": "Non-existent user returns 404"
+    },
+    "battle_cta_top3_is_champion": {
+      "status": "PASS",
+      "notes": "Top-3 weekly thumbs-up users have is_champion=true"
+    },
+    "webhook_bad_json_400": {
+      "status": "PASS",
+      "notes": "POST /api/webhook/stripe-subscription with bad JSON returns 400 bad_json"
+    },
+    "webhook_empty_body_400": {
+      "status": "PASS",
+      "notes": "POST /api/webhook/stripe-subscription with empty body returns 400"
+    },
+    "webhook_lenient_mode": {
+      "status": "PASS",
+      "notes": "Lenient mode accepts valid JSON with invalid signature (verified=false)"
+    },
+    "auth_login_works": {
+      "status": "PASS",
+      "notes": "POST /api/auth/login works, returns token"
+    },
+    "auth_me_works": {
+      "status": "PASS",
+      "notes": "GET /api/auth/me works with session cookie"
+    },
+    "predictor_rip_works": {
+      "status": "PASS",
+      "notes": "POST /api/predictor/rip returns 8 cards"
+    },
+    "leaderboard_dub_streak_works": {
+      "status": "PASS",
+      "notes": "GET /api/leaderboard/dub-streak works with period toggle"
+    },
+    "apscheduler_running": {
+      "status": "PASS",
+      "notes": "Logs show 'APScheduler started — DUB STREAK weekly award fires Mondays 00:05 UTC'"
+    },
+    "frontend_battle_champion_banner": {
+      "status": "PASS",
+      "notes": "BattleChampionBanner visible on champion binder with correct copy and CTA button"
+    },
+    "frontend_dub_streak_leaderboard": {
+      "status": "PASS",
+      "notes": "DUB STREAK leaderboard on /binders page with period toggle and flame icon"
+    },
+    "frontend_login_flow": {
+      "status": "PASS",
+      "notes": "Login with admin@flipnrip.com / AdminPass123! redirects to /vault"
+    }
+  }
+}

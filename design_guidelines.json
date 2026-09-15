@@ -1,0 +1,127 @@
+{
+  "identity": {
+    "name": "The Card Fanatic Bot",
+    "persona": "A high-energy, obsessed sports card expert who speaks in 'HYPE' and 'STATS'. Not a boring AI assistant, but a digital hype-man for collectors.",
+    "vibe": "Electric, Aggressive, Premium, Insider",
+    "archetype": "Electric & Neon (Future/Speed) + Performance Pro"
+  },
+  "typography": {
+    "headings": {
+      "family": "Teko, sans-serif",
+      "weights": ["400", "600", "700"],
+      "usage": "All section titles, hero text, and 'HYPE' metrics. MUST be uppercase for maximum impact.",
+      "letterSpacing": "tracking-tighter"
+    },
+    "body": {
+      "family": "Chivo, sans-serif",
+      "weights": ["400", "500", "700"],
+      "usage": "Paragraphs, data tables, card details. Clean but with a tech edge."
+    },
+    "mono": {
+      "family": "JetBrains Mono, monospace",
+      "usage": "Pricing, serial numbers (e.g., '1/1'), and bot terminal outputs."
+    }
+  },
+  "colors": {
+    "palette": {
+      "background": {
+        "default": "#050505",
+        "paper": "#0A0A0A",
+        "subtle": "#121212"
+      },
+      "primary": {
+        "default": "#00F0FF",
+        "hover": "#00C2CC",
+        "foreground": "#000000"
+      },
+      "secondary": {
+        "default": "#FF0099",
+        "hover": "#CC007A",
+        "foreground": "#FFFFFF"
+      },
+      "accent": {
+        "default": "#39FF14",
+        "foreground": "#000000"
+      },
+      "muted": {
+        "default": "#2A2A2A",
+        "foreground": "#A1A1AA"
+      },
+      "border": {
+        "default": "#27272A",
+        "active": "#00F0FF"
+      }
+    },
+    "gradients": {
+      "holographic": "linear-gradient(135deg, rgba(0,240,255,0.1) 0%, rgba(255,0,153,0.1) 50%, rgba(57,255,20,0.1) 100%)",
+      "glass": "linear-gradient(180deg, rgba(255,255,255,0.05) 0%, rgba(255,255,255,0.01) 100%)",
+      "card_shine": "linear-gradient(110deg, transparent 25%, rgba(255,255,255,0.3) 50%, transparent 75%)"
+    }
+  },
+  "layout": {
+    "spacing_scale": "Generous (2x standard). Use p-8, p-12 for sections.",
+    "container": "max-w-7xl mx-auto px-4 sm:px-6 lg:px-8",
+    "grid_system": {
+      "bento": "Grid with mixed col-spans. Use 'col-span-2 row-span-2' for feature cards.",
+      "masonry": "For card feeds. Allow variable height items."
+    },
+    "border_radius": {
+      "default": "0px",
+      "cards": "4px",
+      "buttons": "0px (Sharp edges for 'Tactical' feel)"
+    }
+  },
+  "components": {
+    "buttons": {
+      "primary": "bg-primary text-primary-foreground hover:bg-primary/90 font-bold uppercase tracking-widest sharp-edges skew-x-[-10deg]",
+      "secondary": "border border-primary text-primary hover:bg-primary/10 font-bold uppercase tracking-widest sharp-edges"
+    },
+    "cards": {
+      "style": "bg-background-paper border border-border hover:border-primary transition-all duration-300 group relative overflow-hidden",
+      "effect": "Add a 'shine' div that translates across the card on hover to simulate holographic refraction."
+    },
+    "inputs": {
+      "style": "bg-background-subtle border-b-2 border-border focus:border-primary outline-none px-4 py-3 text-lg font-mono transition-colors"
+    },
+    "navigation": {
+      "style": "Glassmorphism sticky header. Backdrop-blur-xl, border-b border-white/10."
+    }
+  },
+  "visual_enhancers": {
+    "textures": "Use a subtle 'noise' overlay on the main background to prevent banding and add grit.",
+    "effects": [
+      "Glow: drop-shadow-[0_0_15px_rgba(0,240,255,0.3)] for primary elements.",
+      "Scanlines: Overlay on 'Bot' sections for terminal vibe."
+    ],
+    "animations": {
+      "hover": "transform: translateY(-4px) scale(1.01)",
+      "entrance": "staggered fade-in-up"
+    }
+  },
+  "image_urls": {
+    "hero_background": "https://images.unsplash.com/photo-1696393031198-0914fceee813",
+    "textures": {
+      "card_pile": "https://images.unsplash.com/photo-1551306667-f32e7af055f2",
+      "abstract_hoop": "https://images.unsplash.com/photo-1730446100491-943ddc595d00"
+    },
+    "placeholders": {
+      "card_back": "https://images.unsplash.com/photo-1635783922198-a1432f139961"
+    }
+  },
+  "instructions_to_main_agent": [
+    "1. SETUP: Install 'Teko' and 'Chivo' fonts immediately via Google Fonts in index.html.",
+    "2. THEME: Force DARK MODE by default. Do not create a light mode toggle unless explicitly asked. The brand is 'Night Mode Only'.",
+    "3. LAYOUT: Build the 'Knowledge Hub' as a 'Command Center' - dense data, glowing borders, not a blog layout.",
+    "4. CARDS: When displaying sports cards, wrap them in a 'tilt' effect (using vanilla CSS 3d-transform or a library) to make them feel physical.",
+    "5. BOT: The 'Bot' is not a chat bubble. It is a full-screen or large-panel interface that 'scans' the database. Use typewriter effects for its text.",
+    "6. MARKETPLACE: Use the 'Masonry' layout for the card feed. Do not use uniform rows. Cards have different aspect ratios.",
+    "7. NAVIGATION: Keep it simple. 'Hub' (Knowledge), 'Market' (Buy/Sell), 'Vault' (Profile).",
+    "8. DATA-TESTID: Add data-testid to all interactive elements (buttons, inputs, cards) for testing."
+  ],
+  "universal_guidelines": [
+    "Avoid 'AI Slop': No generic gradients, no centered text blocks without purpose.",
+    "Micro-interactions: Every button must snap or glow on click.",
+    "Spacing: Use p-8+ for section gaps. Don't cram content.",
+    "Images: Use the provided Unsplash URLs for backgrounds. Use placeholders for specific cards if real API data isn't available yet."
+  ]
+}
