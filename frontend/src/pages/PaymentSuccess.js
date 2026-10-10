@@ -87,7 +87,7 @@ export default function PaymentSuccess() {
                   <div className="flex justify-between mb-2">
                     <span className="text-white/50">Amount Paid</span>
                     <span className="font-mono text-[#39FF14]">
-                      ${(paymentData.amount_total / 100).toFixed(2)}
+                      ${Number.isFinite(Number(paymentData.amount_total)) ? Number(paymentData.amount_total).toFixed(2) : "—"}
                     </span>
                   </div>
                   <div className="flex justify-between">

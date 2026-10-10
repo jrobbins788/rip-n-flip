@@ -21,6 +21,7 @@ import httpx
 from bs4 import BeautifulSoup
 import stripe as stripe_sdk
 from emergentintegrations.payments.stripe.checkout import StripeCheckout, CheckoutSessionResponse, CheckoutStatusResponse, CheckoutSessionRequest
+from marketplace_checkout import listing_id_to_mark_sold
 
 ROOT_DIR = Path(__file__).parent
 load_dotenv(ROOT_DIR / '.env')
@@ -346,6 +347,8 @@ async def logout(request: Request, response: Response):
     if token:
         await db.user_sessions.delete_many({"session_token": token})
     response.delete_cookie(key="session_token", path="/")
+    # Older admin logins set this unused cookie name. Clear it so logout is complete.
+    response.delete_cookie(key="auth_token", path="/")
     return {"message": "Logged out"}
 
 @api_router.put("/auth/profile")
@@ -1804,32 +1807,60 @@ async def get_payment_status(session_id: str, request: Request):
 
 @api_router.post("/webhook/stripe")
 async def stripe_webhook(request: Request):
+    """Fulfill a marketplace checkout only after Stripe confirms the session is paid.
+
+    The request body is not trusted for payment_status or listing_id. Anyone can
+    POST JSON here; a forged `payment_status: paid` plus a victim listing id used
+    to mark that listing sold without a charge. We re-fetch the Checkout Session
+    and only update the listing stored on our payment_transactions row.
+    """
     body = await request.body()
-    sig = request.headers.get("Stripe-Signature")
-    
-    host_url = str(request.base_url)
-    webhook_url = f"{host_url}api/webhook/stripe"
-    stripe_checkout = StripeCheckout(api_key=STRIPE_API_KEY, webhook_url=webhook_url)
-    
     try:
-        webhook_response = await stripe_checkout.handle_webhook(body, sig)
-        
-        if webhook_response.payment_status == "paid":
-            listing_id = webhook_response.metadata.get("listing_id")
-            if listing_id:
-                await db.listings.update_one(
-                    {"listing_id": listing_id},
-                    {"$set": {"status": "sold"}}
-                )
-                await db.payment_transactions.update_one(
-                    {"session_id": webhook_response.session_id},
-                    {"$set": {"payment_status": "paid"}}
-                )
-        
-        return {"status": "success"}
+        event = json.loads(body.decode("utf-8"))
+    except Exception:
+        raise HTTPException(status_code=400, detail="bad_json")
+    if not isinstance(event, dict):
+        raise HTTPException(status_code=400, detail="bad_json")
+
+    data_object = (event.get("data") or {}).get("object") or {}
+    if not isinstance(data_object, dict):
+        data_object = {}
+    session_id = data_object.get("id")
+    event_type = str(event.get("type") or "")
+    if event_type and not event_type.startswith("checkout.session."):
+        return {"status": "ignored"}
+    if not isinstance(session_id, str) or not session_id.startswith("cs_"):
+        return {"status": "ignored"}
+
+    if not STRIPE_API_KEY:
+        logger.error("Marketplace webhook ignored: STRIPE_API_KEY is not configured")
+        raise HTTPException(status_code=503, detail="stripe_not_configured")
+
+    try:
+        session = stripe_sdk.checkout.Session.retrieve(session_id)
     except Exception as e:
-        logger.error(f"Webhook error: {e}")
-        return {"status": "error"}
+        logger.warning(f"Marketplace webhook could not retrieve session {session_id}: {e}")
+        raise HTTPException(status_code=400, detail="unknown_session")
+
+    payment_status = session.get("payment_status") if hasattr(session, "get") else None
+    metadata = session.get("metadata") if hasattr(session, "get") else None
+    metadata_listing_id = metadata.get("listing_id") if hasattr(metadata, "get") else None
+
+    transaction = await db.payment_transactions.find_one({"session_id": session_id}, {"_id": 0})
+    listing_id = listing_id_to_mark_sold(transaction, payment_status, metadata_listing_id)
+    if not listing_id:
+        return {"status": "ignored", "payment_status": payment_status}
+
+    if transaction.get("payment_status") != "paid":
+        await db.payment_transactions.update_one(
+            {"session_id": session_id},
+            {"$set": {"payment_status": "paid"}},
+        )
+    await db.listings.update_one(
+        {"listing_id": listing_id},
+        {"$set": {"status": "sold"}},
+    )
+    return {"status": "success"}
 
 @api_router.get("/my-transactions")
 async def get_my_transactions(request: Request):
@@ -2883,15 +2914,24 @@ async def admin_login(payload: AdminLoginRequest, response: Response):
     email_lower = payload.email.lower()
     if email_lower not in ADMIN_EMAILS:
         raise HTTPException(status_code=403, detail="Not authorized as admin")
-    user = await db.users.find_one({"email": email_lower}, {"_id": 0})
+    # Registration stores the address as entered. Lowercasing the whole address
+    # misses accounts whose local-part is mixed case.
+    user = await db.users.find_one({"email": str(payload.email)}, {"_id": 0})
     if not user:
+        user = await db.users.find_one(
+            {"$expr": {"$eq": [{"$toLower": "$email"}, email_lower]}},
+            {"_id": 0},
+        )
+    if not user or not user.get("password_hash"):
         raise HTTPException(status_code=401, detail="Invalid credentials")
     if not bcrypt.checkpw(payload.password.encode(), user["password_hash"].encode()):
         raise HTTPException(status_code=401, detail="Invalid credentials")
 
     token = create_jwt_token(user["user_id"])
+    # Auth reads the session_token cookie (see get_current_user). The previous
+    # auth_token cookie was never consulted, so admin login could not open /admin.
     response.set_cookie(
-        key="auth_token",
+        key="session_token",
         value=token,
         httponly=True,
         secure=True,
@@ -2899,6 +2939,7 @@ async def admin_login(payload: AdminLoginRequest, response: Response):
         max_age=7 * 24 * 60 * 60,
         path="/"
     )
+    response.delete_cookie(key="auth_token", path="/")
     return {
         "user_id": user["user_id"],
         "email": user["email"],
