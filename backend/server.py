@@ -1631,7 +1631,17 @@ async def delete_listing(listing_id: str, request: Request):
         raise HTTPException(status_code=404, detail="Listing not found")
     if listing["user_id"] != user["user_id"]:
         raise HTTPException(status_code=403, detail="Not authorized")
-    
+
+    # Binder cards listed via /listings/from-pull stay status=listed until this
+    # backlink is cleared. Deleting the marketplace row without releasing the
+    # pull hides the sell action forever and blocks a new listing.
+    # Sold cards stay linked so the same pull cannot be listed again.
+    if listing.get("status") != "sold" and listing.get("from_pull_id"):
+        await db.case_pulls.update_one(
+            {"pull_id": listing["from_pull_id"], "listed_listing_id": listing_id},
+            {"$set": {"status": "in_collection"}, "$unset": {"listed_listing_id": ""}},
+        )
+
     await db.listings.delete_one({"listing_id": listing_id})
     return {"message": "Listing deleted"}
 
