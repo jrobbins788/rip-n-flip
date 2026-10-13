@@ -30,7 +30,9 @@ def _db(listing):
     listings = AsyncMock()
     listings.find_one.return_value = listing
     pulls = AsyncMock()
-    db = SimpleNamespace(listings=listings, case_pulls=pulls)
+    trades = AsyncMock()
+    trades.find_one.return_value = None
+    db = SimpleNamespace(listings=listings, case_pulls=pulls, trades=trades)
     return db, listings, pulls
 
 
