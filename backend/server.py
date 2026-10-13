@@ -1631,7 +1631,27 @@ async def delete_listing(listing_id: str, request: Request):
         raise HTTPException(status_code=404, detail="Listing not found")
     if listing["user_id"] != user["user_id"]:
         raise HTTPException(status_code=403, detail="Not authorized")
-    
+
+    # A buyer may have claimed the card after this page rendered it as active.
+    # Deleting out from under that hold leaves them paying for a removed listing.
+    if listing.get("status") == "pending":
+        raise HTTPException(
+            status_code=409,
+            detail="This listing is in a trade or checkout. Cancel it before deleting.",
+        )
+    open_trade = await db.trades.find_one(
+        {
+            "listing_id": listing_id,
+            "status": {"$in": ["awaiting_payment", "paid"]},
+        },
+        {"_id": 0, "trade_id": 1},
+    )
+    if open_trade:
+        raise HTTPException(
+            status_code=409,
+            detail="This listing is in a trade or checkout. Cancel it before deleting.",
+        )
+
     await db.listings.delete_one({"listing_id": listing_id})
     return {"message": "Listing deleted"}
 
@@ -2484,8 +2504,6 @@ async def trade_initiate(payload: TradeInitiate, request: Request):
     listing = await db.listings.find_one({"listing_id": payload.listing_id}, {"_id": 0})
     if not listing:
         raise HTTPException(status_code=404, detail="Listing not found")
-    if listing["status"] != "active":
-        raise HTTPException(status_code=400, detail="Listing not available")
     if listing["user_id"] == user["user_id"]:
         raise HTTPException(status_code=400, detail="Cannot trade with yourself")
 
@@ -2495,6 +2513,20 @@ async def trade_initiate(payload: TradeInitiate, request: Request):
     seller_tag = (seller.get("cash_app_tag") or "").strip().lstrip("$")
     if not seller_tag:
         raise HTTPException(status_code=400, detail="Seller hasn't set a Cash App tag yet")
+
+    # Two buyers can both read status=active before either write lands.
+    # Only a conditional claim may take the card off the market. pending_claim
+    # changes on every attempt, so a second writer cannot look like a no-op.
+    claim = await db.listings.update_one(
+        {"listing_id": payload.listing_id, "status": "active"},
+        {"$set": {"status": "pending", "pending_claim": uuid.uuid4().hex}},
+    )
+    if claim.modified_count != 1:
+        raise HTTPException(status_code=400, detail="Listing not available")
+
+    fresh = await db.listings.find_one({"listing_id": payload.listing_id}, {"_id": 0})
+    if fresh:
+        listing = fresh
 
     base_price = float(listing["price"])
     platform_fee = round(base_price * (PLATFORM_FEE_PERCENT / 100), 2)
@@ -2522,13 +2554,14 @@ async def trade_initiate(payload: TradeInitiate, request: Request):
         "created_at": now_iso,
         "updated_at": now_iso,
     }
-    await db.trades.insert_one(dict(trade_doc))
-
-    # Flag listing as pending
-    await db.listings.update_one(
-        {"listing_id": payload.listing_id},
-        {"$set": {"status": "pending"}}
-    )
+    try:
+        await db.trades.insert_one(dict(trade_doc))
+    except Exception:
+        await db.listings.update_one(
+            {"listing_id": payload.listing_id, "status": "pending"},
+            {"$set": {"status": "active"}, "$unset": {"pending_claim": ""}},
+        )
+        raise
 
     trade_doc.pop("_id", None)
     return trade_doc
@@ -2565,14 +2598,23 @@ async def trade_confirm(trade_id: str, request: Request):
     if trade["status"] not in ("paid", "awaiting_payment"):
         raise HTTPException(status_code=400, detail=f"Can't confirm — status: {trade['status']}")
     now_iso = datetime.now(timezone.utc).isoformat()
-    await db.trades.update_one(
-        {"trade_id": trade_id},
-        {"$set": {"status": "completed", "confirmed_at": now_iso, "updated_at": now_iso}}
+    completed = await db.trades.update_one(
+        {"trade_id": trade_id, "status": {"$in": ["paid", "awaiting_payment"]}},
+        {"$set": {"status": "completed", "confirmed_at": now_iso, "updated_at": now_iso}},
     )
-    await db.listings.update_one(
-        {"listing_id": trade["listing_id"]},
-        {"$set": {"status": "sold"}}
+    if completed.modified_count != 1:
+        raise HTTPException(status_code=400, detail=f"Can't confirm — status: {trade['status']}")
+    sale = await db.listings.update_one(
+        {"listing_id": trade["listing_id"], "status": {"$in": ["pending", "active"]}},
+        {"$set": {"status": "sold"}},
     )
+    if sale.modified_count != 1:
+        # Another trade already sold this card. Don't leave this buyer thinking they won it.
+        await db.trades.update_one(
+            {"trade_id": trade_id, "status": "completed"},
+            {"$set": {"status": trade["status"], "updated_at": now_iso}},
+        )
+        raise HTTPException(status_code=409, detail="This card was already sold")
     return {"trade_id": trade_id, "status": "completed"}
 
 
@@ -2588,16 +2630,25 @@ async def trade_cancel(trade_id: str, request: Request):
     if trade["status"] == "completed":
         raise HTTPException(status_code=400, detail="Trade already completed")
     now_iso = datetime.now(timezone.utc).isoformat()
-    await db.trades.update_one(
-        {"trade_id": trade_id},
-        {"$set": {"status": "canceled", "canceled_at": now_iso, "updated_at": now_iso, "canceled_by": user["user_id"]}}
+    canceled = await db.trades.update_one(
+        {"trade_id": trade_id, "status": {"$in": ["awaiting_payment", "paid"]}},
+        {"$set": {"status": "canceled", "canceled_at": now_iso, "updated_at": now_iso, "canceled_by": user["user_id"]}},
     )
-    # Revert listing to active unless already sold
-    listing = await db.listings.find_one({"listing_id": trade["listing_id"]}, {"_id": 0})
-    if listing and listing["status"] != "sold":
+    if canceled.modified_count != 1:
+        raise HTTPException(status_code=400, detail="Trade is no longer open")
+    # Put the card back only when no other buyer still holds it.
+    other_open = await db.trades.find_one(
+        {
+            "listing_id": trade["listing_id"],
+            "trade_id": {"$ne": trade_id},
+            "status": {"$in": ["awaiting_payment", "paid"]},
+        },
+        {"_id": 0, "trade_id": 1},
+    )
+    if not other_open:
         await db.listings.update_one(
-            {"listing_id": trade["listing_id"]},
-            {"$set": {"status": "active"}}
+            {"listing_id": trade["listing_id"], "status": "pending"},
+            {"$set": {"status": "active"}, "$unset": {"pending_claim": ""}},
         )
     return {"trade_id": trade_id, "status": "canceled"}
 
