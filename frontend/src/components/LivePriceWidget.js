@@ -1,39 +1,94 @@
-import { useEffect, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import axios from 'axios';
 import { TrendingUp, ExternalLink, Loader2, RefreshCw } from 'lucide-react';
 
 const API = `${process.env.REACT_APP_BACKEND_URL}/api`;
+const OBSERVER_ROOT_MARGIN = '800px';
+const OBSERVER_FALLBACK_MS = 3000;
+const FETCH_ATTEMPTS = 2;
 
 /**
  * Live eBay price widget. Shows avg / min / max for a query.
  * Expand to see top listings linking out to eBay.
+ * Fetches once the widget is within 800px of the viewport, or after 3s
+ * if the observer never fires. A failed request is retried once.
  */
 export default function LivePriceWidget({ query, label }) {
   const [data, setData] = useState(null);
-  const [loading, setLoading] = useState(true);
+  const [loading, setLoading] = useState(false);
   const [error, setError] = useState(null);
   const [expanded, setExpanded] = useState(false);
+  const [enabled, setEnabled] = useState(false);
+  const containerRef = useRef(null);
+  const requestId = useRef(0);
 
-  const load = async (refresh = false) => {
+  const load = useCallback(async (refresh = false) => {
+    const id = ++requestId.current;
     setLoading(true);
     setError(null);
-    try {
-      const res = await axios.get(`${API}/packs/price`, { params: { q: query, refresh } });
-      setData(res.data);
-    } catch (e) {
-      setError(e?.response?.data?.detail || 'Price check failed');
-    } finally {
-      setLoading(false);
+    let lastError;
+    for (let attempt = 0; attempt < FETCH_ATTEMPTS; attempt += 1) {
+      if (requestId.current !== id) return;
+      try {
+        const res = await axios.get(`${API}/packs/price`, { params: { q: query, refresh } });
+        if (requestId.current !== id) return;
+        setData(res.data);
+        setLoading(false);
+        return;
+      } catch (e) {
+        lastError = e;
+      }
     }
-  };
+    if (requestId.current !== id) return;
+    setError(lastError?.response?.data?.detail || 'Price check failed');
+    setLoading(false);
+  }, [query]);
 
   useEffect(() => {
+    const node = containerRef.current;
+    let observer;
+    let timer = 0;
+    let settled = false;
+
+    const enable = () => {
+      if (settled) return;
+      settled = true;
+      window.clearTimeout(timer);
+      if (observer) observer.disconnect();
+      setLoading(true);
+      setEnabled(true);
+    };
+
+    timer = window.setTimeout(enable, OBSERVER_FALLBACK_MS);
+
+    if (node && typeof IntersectionObserver !== 'undefined') {
+      observer = new IntersectionObserver(
+        (entries) => {
+          if (entries.some((entry) => entry.isIntersecting)) enable();
+        },
+        { rootMargin: OBSERVER_ROOT_MARGIN },
+      );
+      observer.observe(node);
+    }
+
+    return () => {
+      settled = true;
+      window.clearTimeout(timer);
+      if (observer) observer.disconnect();
+    };
+  }, []);
+
+  useEffect(() => {
+    if (!enabled || !query) return undefined;
     load(false);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [query]);
+    return () => {
+      requestId.current += 1;
+    };
+  }, [enabled, query, load]);
 
   return (
     <div
+      ref={containerRef}
       className="bg-[#121212] border border-[#27272a] p-3 mt-3"
       data-testid={`price-widget-${query.toLowerCase().replace(/[^a-z0-9]/g, '-').slice(0, 40)}`}
     >
