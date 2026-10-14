@@ -12,8 +12,8 @@ Endpoints:
 Webhook hardening:
     • If STRIPE_WEBHOOK_SECRET is set we attempt signature verification.
     • If STRIPE_WEBHOOK_STRICT=true and verification fails → 400 (Stripe retries).
-    • Otherwise (test/dev mode), failed signature is logged & we fall back to
-      plain JSON parse so a test-key/live-secret mismatch never wedges the app.
+    • Subscription user updates are never taken from the request body. The
+      handler re-fetches the subscription from Stripe and applies that object.
 """
 from __future__ import annotations
 
@@ -21,6 +21,7 @@ import json
 import os
 import logging
 from datetime import datetime, timezone
+from typing import Optional
 
 import stripe as stripe_sdk
 from fastapi import APIRouter, HTTPException, Request
@@ -36,6 +37,7 @@ from core import (
     STRIPE_API_KEY,
     PRO_PRICE_AMOUNT_USD,
 )
+from subscription_sync import subscription_write_from_stripe
 
 router = APIRouter(prefix="/api", tags=["subscription"])
 
@@ -204,16 +206,33 @@ async def subscription_cancel(request: Request):
         raise HTTPException(status_code=502, detail=str(e))
 
 
+def _event_dict(event) -> Optional[dict]:
+    if isinstance(event, dict):
+        return event
+    if hasattr(event, "to_dict_recursive"):
+        converted = event.to_dict_recursive()
+        return converted if isinstance(converted, dict) else None
+    if hasattr(event, "to_dict"):
+        converted = event.to_dict()
+        return converted if isinstance(converted, dict) else None
+    return None
+
+
+def _stripe_miss(exc: Exception) -> bool:
+    """True when Stripe has no such subscription. Other failures should retry."""
+    status = getattr(exc, "http_status", None)
+    code = getattr(exc, "code", None)
+    return status == 404 or code == "resource_missing"
+
+
 @router.post("/webhook/stripe-subscription")
 async def stripe_subscription_webhook(request: Request):
     """Stripe lifecycle webhook for subscription events.
 
-    Signature verification flow:
-      • Secret set + STRICT=true → construct_event() must succeed (else 400)
-      • Secret set + lenient    → try construct_event, log on failure & fall
-                                   back to JSON so test/live mismatches don't
-                                   take the endpoint down.
-      • Secret missing          → JSON parse only (dev mode).
+    The request body is only used to learn the event type and subscription id.
+    Pro access is copied from Subscription.retrieve, never from the JSON a
+    caller posted. STRIPE_WEBHOOK_STRICT=true still rejects a bad signature
+    before that lookup.
     """
     body = await request.body()
     sig = request.headers.get("Stripe-Signature", "")
@@ -233,7 +252,7 @@ async def stripe_subscription_webhook(request: Request):
                 logger.error(f"[webhook] signature verification FAILED (strict): {e}")
                 return JSONResponse({"received": False, "error": "invalid_signature"}, status_code=400)
             logger.warning(
-                f"[webhook] signature mismatch (lenient mode, falling back to JSON parse): {e}"
+                f"[webhook] signature mismatch (lenient mode, will not trust body fields): {e}"
             )
 
     if event is None:
@@ -243,55 +262,56 @@ async def stripe_subscription_webhook(request: Request):
             logger.error(f"[webhook] body parse failed: {e}")
             return JSONResponse({"received": False, "error": "bad_json"}, status_code=400)
 
+    event = _event_dict(event)
+    if not isinstance(event, dict):
+        return JSONResponse({"received": False, "error": "bad_json"}, status_code=400)
+
     etype = event.get("type")
     obj = (event.get("data") or {}).get("object") or {}
+    if not isinstance(obj, dict):
+        obj = {}
 
-    if etype in (
+    if etype not in (
         "customer.subscription.created",
         "customer.subscription.updated",
         "customer.subscription.deleted",
     ):
-        sub_id = obj.get("id")
-        customer_id = obj.get("customer")
-        status = obj.get("status")
-        cancel_at_period_end = obj.get("cancel_at_period_end", False)
-        period_end = obj.get("current_period_end")
-        if period_end:
-            period_end = datetime.fromtimestamp(period_end, tz=timezone.utc).isoformat()
-        user = await db.users.find_one(
-            {"subscription.stripe_customer_id": customer_id}, {"_id": 0}
-        )
-        if user:
-            sub_set = {
-                "subscription.status": status,
-                "subscription.stripe_subscription_id": sub_id,
-                "subscription.current_period_end": period_end,
-                "subscription.cancel_at_period_end": cancel_at_period_end,
-                "subscription.updated_at": datetime.now(timezone.utc).isoformat(),
-            }
-            if etype == "customer.subscription.deleted":
-                sub_set["subscription.status"] = "canceled"
-            # Reflect on top-level tier/pro_until so user_tier() honors it
-            if status == "active" and period_end:
-                sub_set["tier"] = "pro"
-                sub_set["pro_until"] = period_end
-                sub_set["pro_source"] = "stripe_subscription"
-            elif etype == "customer.subscription.deleted":
-                sub_set["tier"] = "free"
-            await db.users.update_one({"user_id": user["user_id"]}, {"$set": sub_set})
-            logger.info(
-                f"[webhook] {etype} user={user['user_id']} status={status} verified={verified}"
-            )
+        # Invoice and other events are acknowledged. Payment status in the body
+        # is not applied; a forged invoice used to be able to mark rows paid.
+        return {"received": True, "verified": verified, "applied": False}
 
-    elif etype == "invoice.payment_succeeded":
-        customer_id = obj.get("customer")
-        await db.payment_transactions.update_one(
-            {"metadata.stripe_customer_id": customer_id, "type": "subscription_invoice"},
-            {"$set": {"payment_status": "paid"}},
-            upsert=False,
-        )
+    sub_id = obj.get("id")
+    if not isinstance(sub_id, str) or not sub_id.startswith("sub_"):
+        return {"received": True, "verified": verified, "applied": False}
 
-    return {"received": True, "verified": verified}
+    try:
+        retrieved = stripe_sdk.Subscription.retrieve(sub_id)
+    except Exception as e:
+        if _stripe_miss(e):
+            logger.info(f"[webhook] ignoring unknown subscription {sub_id}: {e}")
+            return {"received": True, "verified": verified, "applied": False}
+        logger.error(f"[webhook] could not retrieve subscription {sub_id}: {e}")
+        return JSONResponse({"received": False, "error": "stripe_unavailable"}, status_code=503)
+
+    decision = subscription_write_from_stripe(retrieved)
+    if not decision:
+        logger.info(f"[webhook] retrieved subscription {sub_id} had no applicable customer/status")
+        return {"received": True, "verified": verified, "applied": False}
+
+    customer_id = decision["customer_id"]
+    user = await db.users.find_one(
+        {"subscription.stripe_customer_id": customer_id}, {"_id": 0}
+    )
+    if not user:
+        return {"received": True, "verified": verified, "applied": False}
+
+    sub_set = dict(decision["set"])
+    sub_set["subscription.updated_at"] = datetime.now(timezone.utc).isoformat()
+    await db.users.update_one({"user_id": user["user_id"]}, {"$set": sub_set})
+    logger.info(
+        f"[webhook] {etype} user={user['user_id']} status={sub_set.get('subscription.status')} verified={verified}"
+    )
+    return {"received": True, "verified": verified, "applied": True}
 
 
 @router.get("/subscription/admin/info")
