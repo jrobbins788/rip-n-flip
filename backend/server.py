@@ -4,7 +4,7 @@ import csv
 import io
 import base64
 from dotenv import load_dotenv
-from starlette.middleware.cors import CORSMiddleware
+from cors_config import install_cors
 from motor.motor_asyncio import AsyncIOMotorClient
 import os
 import json
@@ -3769,13 +3769,10 @@ app.include_router(subscription_router)
 app.include_router(social_router)
 app.include_router(push_router)
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_credentials=True,
-    allow_origins=os.environ.get('CORS_ORIGINS', '*').split(','),
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+# Outermost user middleware. Echoes an explicit origin (never "*") and
+# attaches the same headers to unhandled 500s. CORS_ORIGINS adds extras;
+# "*" is ignored. Production origins are always included — see cors_config.py.
+install_cors(app)
 
 
 # ── Background scheduler — automates DUB STREAK weekly reward ──
