@@ -1491,6 +1491,8 @@ async def listings_from_pull(payload: ListFromPullRequest, request: Request):
         raise HTTPException(status_code=403, detail="Not your pull")
     if pull.get("listed_listing_id"):
         raise HTTPException(status_code=400, detail="This pull is already listed")
+    if float(payload.price) <= 0:
+        raise HTTPException(status_code=400, detail="Price must be greater than zero")
 
     card = pull.get("card") or {}
     title_parts = []
@@ -1523,13 +1525,31 @@ async def listings_from_pull(payload: ListFromPullRequest, request: Request):
         "from_pull_id": payload.pull_id,
         "created_at": datetime.now(timezone.utc).isoformat(),
     }
-    await db.listings.insert_one(listing_doc)
 
-    # Backlink the pull to the listing
-    await db.case_pulls.update_one(
-        {"pull_id": payload.pull_id},
-        {"$set": {"listed_listing_id": listing_id, "status": "listed"}}
+    # Claim the pull before inserting the listing. Two simultaneous sells
+    # otherwise both observe an unlisted pull and create two live listings.
+    claim = await db.case_pulls.update_one(
+        {
+            "pull_id": payload.pull_id,
+            "user_id": user["user_id"],
+            "$or": [
+                {"listed_listing_id": None},
+                {"listed_listing_id": ""},
+            ],
+        },
+        {"$set": {"listed_listing_id": listing_id, "status": "listed"}},
     )
+    if claim.modified_count != 1:
+        raise HTTPException(status_code=400, detail="This pull is already listed")
+
+    try:
+        await db.listings.insert_one(listing_doc)
+    except Exception:
+        await db.case_pulls.update_one(
+            {"pull_id": payload.pull_id, "listed_listing_id": listing_id},
+            {"$unset": {"listed_listing_id": ""}, "$set": {"status": "in_collection"}},
+        )
+        raise
     listing_doc.pop("_id", None)
     return listing_doc
 
@@ -3306,6 +3326,36 @@ async def case_list_packs(request: Request):
     return {"packs": items, "tier": tier}
 
 
+async def _withdraw_active_listing(listing_id: Optional[str]) -> None:
+    """Take an unsold active listing off the market.
+
+    Pending checkouts are rejected so a buyer is not charged for a card that
+    was just removed from the binder. Sold listings are kept as the sale record.
+    """
+    if not listing_id:
+        return
+    listing = await db.listings.find_one(
+        {"listing_id": listing_id}, {"_id": 0, "status": 1}
+    )
+    if not listing:
+        return
+    if listing.get("status") == "pending":
+        raise HTTPException(
+            status_code=409,
+            detail="This card is in an active checkout and can't be removed until that sale finishes or expires",
+        )
+    if listing.get("status") != "active":
+        return
+    result = await db.listings.delete_one({"listing_id": listing_id, "status": "active"})
+    if result.deleted_count == 0:
+        fresh = await db.listings.find_one({"listing_id": listing_id}, {"_id": 0, "status": 1})
+        if fresh and fresh.get("status") == "pending":
+            raise HTTPException(
+                status_code=409,
+                detail="This card is in an active checkout and can't be removed until that sale finishes or expires",
+            )
+
+
 @api_router.delete("/case/packs/{case_pack_id}")
 async def case_delete_pack(case_pack_id: str, request: Request):
     user = await require_auth(request)
@@ -3314,6 +3364,23 @@ async def case_delete_pack(case_pack_id: str, request: Request):
         raise HTTPException(status_code=404, detail="Pack not in your case")
     if pack["user_id"] != user["user_id"]:
         raise HTTPException(status_code=403, detail="Not your pack")
+    pulls = await db.case_pulls.find(
+        {"case_pack_id": case_pack_id}, {"_id": 0, "listed_listing_id": 1}
+    ).to_list(1000)
+    for pull in pulls:
+        listing_id = pull.get("listed_listing_id")
+        if not listing_id:
+            continue
+        listing = await db.listings.find_one({"listing_id": listing_id}, {"_id": 0, "status": 1})
+        if listing and listing.get("status") == "pending":
+            raise HTTPException(
+                status_code=409,
+                detail="A card in this binder is in an active checkout and can't be removed yet",
+            )
+    for pull in pulls:
+        listing_id = pull.get("listed_listing_id")
+        if listing_id:
+            await db.listings.delete_one({"listing_id": listing_id, "status": "active"})
     await db.case_packs.delete_one({"case_pack_id": case_pack_id})
     await db.case_pulls.delete_many({"case_pack_id": case_pack_id})
     return {"deleted": True}
@@ -3451,6 +3518,7 @@ async def case_delete_pull(pull_id: str, request: Request):
         raise HTTPException(status_code=404, detail="Pull not found")
     if pull["user_id"] != user["user_id"]:
         raise HTTPException(status_code=403, detail="Not your pull")
+    await _withdraw_active_listing(pull.get("listed_listing_id"))
     await db.case_pulls.delete_one({"pull_id": pull_id})
     await db.case_packs.update_one(
         {"case_pack_id": pull["case_pack_id"]},
