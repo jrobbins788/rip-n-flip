@@ -20,12 +20,14 @@ from fastapi import HTTPException, Request
 from jose import jwt, JWTError
 from motor.motor_asyncio import AsyncIOMotorClient
 
+from services.db_guard import mongo_client_kwargs
+
 ROOT_DIR = Path(__file__).parent
 load_dotenv(ROOT_DIR / ".env")
 
 # ─── MongoDB singleton ──────────────────────────────────────
 mongo_url = os.environ["MONGO_URL"]
-mongo_client = AsyncIOMotorClient(mongo_url)
+mongo_client = AsyncIOMotorClient(mongo_url, **mongo_client_kwargs())
 db = mongo_client[os.environ["DB_NAME"]]
 
 # ─── JWT ────────────────────────────────────────────────────
