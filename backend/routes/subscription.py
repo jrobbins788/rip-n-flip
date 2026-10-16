@@ -262,6 +262,12 @@ async def stripe_subscription_webhook(request: Request):
             {"subscription.stripe_customer_id": customer_id}, {"_id": 0}
         )
         if user:
+            from entitlements import webhook_regrant_blocked
+            if webhook_regrant_blocked(user, etype, sub_id, status):
+                logger.info(
+                    f"[webhook] ignoring {etype} for admin-revoked subscription {sub_id}"
+                )
+                return {"received": True, "verified": verified, "ignored": "admin_revoke"}
             sub_set = {
                 "subscription.status": status,
                 "subscription.stripe_subscription_id": sub_id,
@@ -276,6 +282,7 @@ async def stripe_subscription_webhook(request: Request):
                 sub_set["tier"] = "pro"
                 sub_set["pro_until"] = period_end
                 sub_set["pro_source"] = "stripe_subscription"
+                sub_set["subscription.revoked_by_admin"] = False
             elif etype == "customer.subscription.deleted":
                 sub_set["tier"] = "free"
             await db.users.update_one({"user_id": user["user_id"]}, {"$set": sub_set})
