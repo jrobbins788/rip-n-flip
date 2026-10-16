@@ -14,10 +14,12 @@ import {
 import { Search, Filter, Plus, ShoppingBag, RefreshCcw, DollarSign } from 'lucide-react';
 import { useAuth } from '../context/AuthContext';
 
+import usePageMeta from '../hooks/usePageMeta';
 const BACKEND_URL = process.env.REACT_APP_BACKEND_URL;
 const API = `${BACKEND_URL}/api`;
 
 export default function Marketplace() {
+  usePageMeta({ title: "Marketplace — Rip N' Flip", description: "Buy, sell, and trade cards with collectors.", path: '/marketplace' });
   const { user } = useAuth();
   const [listings, setListings] = useState([]);
   const [loading, setLoading] = useState(true);

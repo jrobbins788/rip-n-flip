@@ -4,9 +4,11 @@ import axios from 'axios';
 import Navbar from '../components/Navbar';
 import { Layers, ArrowRight, Eye, TrendingUp, Loader2, Flame, ThumbsUp, Trophy } from 'lucide-react';
 
+import usePageMeta from '../hooks/usePageMeta';
 const API = `${process.env.REACT_APP_BACKEND_URL}/api`;
 
 export default function PublicGallery() {
+  usePageMeta({ title: "Community Binder — Rip N' Flip", description: "Real collectors and real pulls. Tap a binder to see the cards; source packs are hidden.", path: '/binders' });
   const [binders, setBinders] = useState([]);
   const [loading, setLoading] = useState(true);
   const [sport, setSport] = useState('');

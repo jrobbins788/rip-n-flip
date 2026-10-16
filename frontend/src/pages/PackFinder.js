@@ -6,10 +6,12 @@ import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { Package, ExternalLink, DollarSign, Store, Zap } from 'lucide-react';
 import LivePriceWidget from '../components/LivePriceWidget';
 
+import usePageMeta from '../hooks/usePageMeta';
 const BACKEND_URL = process.env.REACT_APP_BACKEND_URL;
 const API = `${BACKEND_URL}/api`;
 
 export default function PackFinder() {
+  usePageMeta({ title: "Pack Finder — Rip N' Flip", description: "Compare pack prices across retailers and find the best deals.", path: '/packs' });
   const [packs, setPacks] = useState({});
   const [retailers, setRetailers] = useState({});
   const [blasters, setBlasters] = useState([]);

@@ -5,6 +5,7 @@ import Navbar from '../components/Navbar';
 import ShareVerdictButton from '../components/ShareVerdictButton';
 import { Brain, ArrowLeft, TrendingUp, Trophy, Skull, Sparkles, Loader2, Flame, ExternalLink } from 'lucide-react';
 
+import usePageMeta from '../hooks/usePageMeta';
 const API = `${process.env.REACT_APP_BACKEND_URL}/api`;
 
 const sportColors = {
@@ -22,6 +23,7 @@ const verdictStyle = {
 };
 
 export default function Analyzer() {
+  usePageMeta({ title: "Pack Analyzer — Rip N' Flip", description: "Pick a pack and get an instant, market-verified verdict: DUB, MID, or TRASH. Know before you rip.", path: '/analyzer' });
   const [searchParams, setSearchParams] = useSearchParams();
   const [packs, setPacks] = useState([]);
   const [loadingList, setLoadingList] = useState(true);

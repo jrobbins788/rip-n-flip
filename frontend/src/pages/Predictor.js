@@ -5,6 +5,7 @@ import { motion, AnimatePresence } from 'framer-motion';
 import Navbar from '../components/Navbar';
 import { Dice5, ArrowLeft, Sparkles, TrendingUp, RefreshCw, Lock, Loader2 } from 'lucide-react';
 
+import usePageMeta from '../hooks/usePageMeta';
 const API = `${process.env.REACT_APP_BACKEND_URL}/api`;
 
 const sportColors = {
@@ -16,6 +17,7 @@ const sportColors = {
 };
 
 export default function Predictor() {
+  usePageMeta({ title: "Pack Predictor — Rip N' Flip", description: "Pick a pack, hit RIP, and see what you might pull. Just for fun, not a prediction you should bet on.", path: '/predictor' });
   const [searchParams] = useSearchParams();
   const [packs, setPacks] = useState([]);
   const [selectedId, setSelectedId] = useState(searchParams.get('pack') || null);

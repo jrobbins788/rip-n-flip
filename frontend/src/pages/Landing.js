@@ -8,6 +8,7 @@ import { Button } from '@/components/ui/button';
 import { Brain, ArrowRight, Sparkles, Dice5, Layers, Lock, Zap, ShoppingBag, TrendingUp, Database, Eye } from 'lucide-react';
 import { colorizeWords } from '../lib/colorize';
 
+import usePageMeta from '../hooks/usePageMeta';
 const API = `${process.env.REACT_APP_BACKEND_URL}/api`;
 const ACCENT = '#39FF14'; // bright green — user's accent of choice
 
@@ -18,6 +19,7 @@ const ANALYZE_WORDS = ['ANALYZE', 'NOW'];
 const ANALYZE_COLORS = colorizeWords(ANALYZE_WORDS, /* keepWhite */ 0);
 
 export default function Landing() {
+  usePageMeta({ title: "Rip N' Flip — Know before you rip", description: "Drop any pack, box, or card into the Analyzer and get an instant, market-verified verdict before you buy. Log your pulls in a digital binder.", path: '/' });
   const { user } = useAuth();
   const [topPacks, setTopPacks] = useState([]);
 
