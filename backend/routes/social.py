@@ -23,6 +23,7 @@ from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel
 
 from core import db, get_current_user, require_auth
+from services.public_reads import fetch_public_binders
 
 
 router = APIRouter(prefix="/api", tags=["social"])
@@ -56,40 +57,7 @@ async def case_set_visibility(case_pack_id: str, payload: BinderVisibilityUpdate
 @router.get("/binders/public")
 async def list_public_binders(limit: int = 24, sport: Optional[str] = None):
     """Aggregated public gallery — users with public binders + counts."""
-    match: dict = {"is_public": True}
-    if sport:
-        match["sport"] = sport
-    pipeline = [
-        {"$match": match},
-        {"$group": {
-            "_id": "$user_id",
-            "binder_count": {"$sum": 1},
-            "pulls_total": {"$sum": "$pulls_count"},
-            "sports": {"$addToSet": "$sport"},
-            "latest": {"$max": "$updated_at"},
-        }},
-        {"$sort": {"latest": -1}},
-        {"$limit": int(limit)},
-    ]
-    rows = await db.case_packs.aggregate(pipeline).to_list(int(limit))
-    out = []
-    for r in rows:
-        u = await db.users.find_one(
-            {"user_id": r["_id"]},
-            {"_id": 0, "username": 1, "name": 1, "user_id": 1, "picture": 1},
-        )
-        if not u:
-            continue
-        out.append({
-            "user_id": u["user_id"],
-            "username": u.get("username") or u.get("name") or "Anonymous",
-            "picture": u.get("picture"),
-            "binder_count": r.get("binder_count", 0),
-            "pulls_total": r.get("pulls_total", 0),
-            "sports": [s for s in (r.get("sports") or []) if s],
-            "latest": r.get("latest"),
-        })
-    return {"binders": out, "count": len(out)}
+    return await fetch_public_binders(db, limit=limit, sport=sport)
 
 
 # ─── Single user's public binder ───────────────────────────
