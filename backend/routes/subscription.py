@@ -306,6 +306,18 @@ async def stripe_subscription_webhook(request: Request):
         return {"received": True, "verified": verified, "applied": False}
 
     sub_set = dict(decision["set"])
+    retrieved_status = sub_set.get("subscription.status")
+    retrieved_sub_id = sub_set.get("subscription.stripe_subscription_id")
+    # The event type in the body is not a source of truth. A forged
+    # "deleted" event must not skip this check while Stripe still says active.
+    from entitlements import webhook_regrant_blocked
+    if webhook_regrant_blocked(user, None, retrieved_sub_id, retrieved_status):
+        logger.info(
+            f"[webhook] ignoring {etype} for admin-revoked subscription {retrieved_sub_id}"
+        )
+        return {"received": True, "verified": verified, "applied": False, "ignored": "admin_revoke"}
+    if retrieved_status == "active":
+        sub_set["subscription.revoked_by_admin"] = False
     sub_set["subscription.updated_at"] = datetime.now(timezone.utc).isoformat()
     await db.users.update_one({"user_id": user["user_id"]}, {"$set": sub_set})
     logger.info(

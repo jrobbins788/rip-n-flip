@@ -3197,29 +3197,15 @@ async def admin_list_users(request: Request, limit: int = 100, offset: int = 0, 
             {"email": {"$regex": re.escape(search), "$options": "i"}},
             {"name": {"$regex": re.escape(search), "$options": "i"}},
         ]
+    from entitlements import admin_display_tier
+
     cursor = db.users.find(query, {"_id": 0, "password_hash": 0}).sort("created_at", -1).skip(offset).limit(limit)
     users = []
     now = datetime.now(timezone.utc)
     async for u in cursor:
-        created = u.get("created_at")
-        if isinstance(created, str):
-            try:
-                created_dt = datetime.fromisoformat(created)
-                if created_dt.tzinfo is None:
-                    created_dt = created_dt.replace(tzinfo=timezone.utc)
-            except ValueError:
-                created_dt = None
-        else:
-            created_dt = created
-        in_trial = bool(created_dt and (now - created_dt) <= timedelta(days=10))
         sub = u.get("subscription") or {}
         sub_status = sub.get("status")
-        if sub_status == "active":
-            tier = "pro"
-        elif in_trial:
-            tier = "trial"
-        else:
-            tier = "free"
+        tier = admin_display_tier(u, now)
         users.append({
             "user_id": u.get("user_id"),
             "email": u.get("email"),
@@ -3239,37 +3225,47 @@ async def admin_list_users(request: Request, limit: int = 100, offset: int = 0, 
 async def admin_grant_pro(user_id: str, request: Request, days: int = 30):
     """Admin: manually grant Pro access for N days (no Stripe charge — comp/promo)."""
     await require_admin(request)
+    if days < 1 or days > 3660:
+        raise HTTPException(status_code=400, detail="days must be between 1 and 3660")
     user = await db.users.find_one({"user_id": user_id}, {"_id": 0})
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
-    period_end = (datetime.now(timezone.utc) + timedelta(days=days)).isoformat()
-    await db.users.update_one(
-        {"user_id": user_id},
-        {"$set": {
-            "subscription.status": "active",
-            "subscription.granted_by_admin": True,
-            "subscription.current_period_end": period_end,
-            "subscription.granted_at": datetime.now(timezone.utc).isoformat(),
-        }}
-    )
-    return {"granted": True, "user_id": user_id, "days": days, "period_end": period_end}
+    from entitlements import build_admin_grant_update
+    now = datetime.now(timezone.utc)
+    update = build_admin_grant_update(user, days, now)
+    await db.users.update_one({"user_id": user_id}, update)
+    return {
+        "granted": True,
+        "user_id": user_id,
+        "days": days,
+        "period_end": update["$set"]["pro_until"],
+    }
 
 
 @api_router.post("/admin/users/{user_id}/revoke-pro")
 async def admin_revoke_pro(user_id: str, request: Request):
-    """Admin: revoke Pro access immediately."""
+    """Admin: revoke Pro access immediately.
+
+    Clears tier, pro_until, and the subscription window the feature gates
+    read. A later Stripe "active" webhook for the same subscription is ignored.
+    When a real Stripe subscription id is stored, cancel it so billing stops.
+    """
     await require_admin(request)
     user = await db.users.find_one({"user_id": user_id}, {"_id": 0})
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
-    await db.users.update_one(
-        {"user_id": user_id},
-        {"$set": {
-            "subscription.status": "canceled",
-            "subscription.revoked_by_admin": True,
-            "subscription.revoked_at": datetime.now(timezone.utc).isoformat(),
-        }}
-    )
+
+    sub_id = ((user.get("subscription") or {}).get("stripe_subscription_id") or "").strip()
+    stripe_key = (STRIPE_API_KEY or "").strip()
+    if sub_id and stripe_key and stripe_key != "sk_test_emergent":
+        try:
+            stripe_sdk.Subscription.cancel(sub_id)
+        except Exception as e:
+            logger.error(f"Admin revoke could not cancel Stripe subscription {sub_id}: {e}")
+
+    from entitlements import build_admin_revoke_update
+    now = datetime.now(timezone.utc)
+    await db.users.update_one({"user_id": user_id}, build_admin_revoke_update(now))
     return {"revoked": True, "user_id": user_id}
 
 
@@ -3386,42 +3382,19 @@ class CasePullCreate(BaseModel):
 
 async def _user_tier(user_id: str) -> str:
     """Return 'pro' or 'free' for a user. Pro counts when:
-      - subscription.status == 'active' (Stripe)
-      - tier == 'pro' AND pro_until is in the future (e.g. DUB STREAK reward)
+      - subscription.status == 'active' and current_period_end is still ahead
+        (a missing end date still counts, an expired one does not)
+      - tier == 'pro' AND pro_until is in the future (reward or admin comp)
       - inside 10-day signup trial
     """
+    from entitlements import signup_trial_active, user_record_is_pro
+
     user = await db.users.find_one({"user_id": user_id}, {"_id": 0})
     if not user:
         return "free"
     now = datetime.now(timezone.utc)
-
-    sub = user.get("subscription", {})
-    if sub.get("status") == "active":
+    if user_record_is_pro(user, now) or signup_trial_active(user, now):
         return "pro"
-
-    # Reward / manual Pro grant — honors pro_until window
-    if user.get("tier") == "pro":
-        pro_until = user.get("pro_until")
-        if isinstance(pro_until, str):
-            try:
-                pu = datetime.fromisoformat(pro_until)
-                if pu.tzinfo is None:
-                    pu = pu.replace(tzinfo=timezone.utc)
-                if pu > now:
-                    return "pro"
-            except ValueError:
-                return "pro"
-        else:
-            return "pro"
-
-    # Check trial: 10 days from registration
-    created = user.get("created_at")
-    if isinstance(created, str):
-        created = datetime.fromisoformat(created)
-    if created and created.tzinfo is None:
-        created = created.replace(tzinfo=timezone.utc)
-    if created and (now - created) <= timedelta(days=10):
-        return "pro"  # in trial
     return "free"
 
 
