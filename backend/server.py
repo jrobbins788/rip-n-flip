@@ -1611,12 +1611,20 @@ async def update_listing(listing_id: str, listing_data: ListingCreate, request: 
         raise HTTPException(status_code=404, detail="Listing not found")
     if listing["user_id"] != user["user_id"]:
         raise HTTPException(status_code=403, detail="Not authorized")
-    
-    await db.listings.update_one(
-        {"listing_id": listing_id},
-        {"$set": listing_data.model_dump()}
+
+    # A buyer may already be paying the price and card shown at checkout, or
+    # the sale may already be the record of what they bought. Editing either
+    # one rewrites that record. Only an active listing can still change.
+    result = await db.listings.update_one(
+        {"listing_id": listing_id, "user_id": user["user_id"], "status": "active"},
+        {"$set": listing_data.model_dump()},
     )
-    
+    if result.matched_count != 1:
+        raise HTTPException(
+            status_code=409,
+            detail="Only active listings can be edited. A pending checkout or completed sale keeps the original card.",
+        )
+
     updated = await db.listings.find_one({"listing_id": listing_id}, {"_id": 0})
     if isinstance(updated.get("created_at"), str):
         updated["created_at"] = datetime.fromisoformat(updated["created_at"])
@@ -1631,8 +1639,21 @@ async def delete_listing(listing_id: str, request: Request):
         raise HTTPException(status_code=404, detail="Listing not found")
     if listing["user_id"] != user["user_id"]:
         raise HTTPException(status_code=403, detail="Not authorized")
-    
-    await db.listings.delete_one({"listing_id": listing_id})
+    if listing.get("status") == "sold":
+        raise HTTPException(
+            status_code=409,
+            detail="Sold listings stay up as the record of the sale.",
+        )
+
+    # Status can flip to sold between the read above and this delete.
+    result = await db.listings.delete_one(
+        {"listing_id": listing_id, "user_id": user["user_id"], "status": {"$ne": "sold"}},
+    )
+    if result.deleted_count != 1:
+        raise HTTPException(
+            status_code=409,
+            detail="Sold listings stay up as the record of the sale.",
+        )
     return {"message": "Listing deleted"}
 
 @api_router.get("/my-listings")
