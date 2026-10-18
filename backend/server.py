@@ -1774,6 +1774,40 @@ async def get_conversation(other_user_id: str, request: Request):
 
 PLATFORM_FEE_PERCENT = 2.0  # 2% platform fee on every successful sale
 
+# Fields a buyer sees before paying. Checkout reads them, then claims the
+# listing; a seller edit can land between those two writes.
+_SALE_IDENTITY_FIELDS = (
+    "title",
+    "description",
+    "player_name",
+    "condition",
+    "sport",
+    "card_type",
+    "year",
+    "brand",
+    "team",
+)
+
+
+def _sale_price(value: Any) -> Optional[float]:
+    try:
+        return round(float(value), 2)
+    except (TypeError, ValueError):
+        return None
+
+
+def _sale_identity(listing: dict) -> tuple:
+    """Snapshot of the card and price a checkout is allowed to charge for."""
+    images = listing.get("images")
+    if not isinstance(images, list):
+        images = []
+    return (
+        _sale_price(listing.get("price")),
+        tuple(images),
+        tuple(listing.get(field) for field in _SALE_IDENTITY_FIELDS),
+    )
+
+
 def _retrieve_marketplace_session(session_id: str):
     return stripe_sdk.checkout.Session.retrieve(session_id)
 
@@ -1801,13 +1835,11 @@ async def create_checkout(checkout_data: CheckoutRequest, request: Request):
     if listing["status"] != "active":
         raise HTTPException(status_code=400, detail="Listing is not available")
 
-    # Calculate total with platform fee
-    base_price = float(listing["price"])
-    platform_fee = base_price * (PLATFORM_FEE_PERCENT / 100)
-    total_amount = base_price + platform_fee
-
     # Claim the listing before talking to Stripe. Two buyers used to both
     # pass the status check, both pay, and one card was sold twice.
+    # The price and card are read before this claim. A seller edit can commit
+    # in between, so charge only if the claimed document is still that card.
+    offered = _sale_identity(listing)
     pending_since = datetime.now(timezone.utc).isoformat()
     claim = await db.listings.update_one(
         {"listing_id": checkout_data.listing_id, "status": "active"},
@@ -1815,6 +1847,23 @@ async def create_checkout(checkout_data: CheckoutRequest, request: Request):
     )
     if claim.modified_count != 1:
         raise HTTPException(status_code=400, detail="Listing is not available")
+
+    claimed = await db.listings.find_one({"listing_id": checkout_data.listing_id}, {"_id": 0})
+    if not claimed or _sale_identity(claimed) != offered:
+        await db.listings.update_one(
+            {"listing_id": checkout_data.listing_id, "status": "pending", "pending_since": pending_since},
+            {"$set": {"status": "active"}, "$unset": {"pending_since": ""}},
+        )
+        raise HTTPException(
+            status_code=409,
+            detail="This listing changed while checkout was starting. Refresh and try again.",
+        )
+    listing = claimed
+
+    # Calculate total with platform fee from the card that was actually claimed.
+    base_price = float(listing["price"])
+    platform_fee = base_price * (PLATFORM_FEE_PERCENT / 100)
+    total_amount = base_price + platform_fee
 
     # Build URLs from frontend origin
     success_url = f"{checkout_data.origin_url}/payment-success?session_id={{CHECKOUT_SESSION_ID}}"
