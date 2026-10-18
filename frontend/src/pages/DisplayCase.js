@@ -311,11 +311,19 @@ function BinderView({ casePackId, onClose }) {
   };
   useEffect(() => { load(); }, [casePackId]);
 
-  const deletePull = async (pullId) => {
-    if (!window.confirm('Remove this pull from your binder?')) return;
-    await axios.delete(`${API}/case/pulls/${pullId}`, { withCredentials: true });
-    toast.success('Pull removed');
-    load();
+  const deletePull = async (pull) => {
+    const listed = pull.status === 'listed' || pull.listed_listing_id;
+    const message = listed
+      ? 'Remove this pull and take the marketplace listing down?'
+      : 'Remove this pull from your binder?';
+    if (!window.confirm(message)) return;
+    try {
+      await axios.delete(`${API}/case/pulls/${pull.pull_id}`, { withCredentials: true });
+      toast.success(listed ? 'Pull removed and listing withdrawn' : 'Pull removed');
+      load();
+    } catch (err) {
+      toast.error(err?.response?.data?.detail || 'Could not remove pull');
+    }
   };
 
   return (
@@ -584,7 +592,7 @@ function SolitaireSpread({ pulls, onDelete, onSell }) {
               className="relative"
               data-testid={`pull-${pull.pull_id}`}
             >
-              <PullCard pull={pull} onDelete={() => onDelete(pull.pull_id)} onSell={() => onSell(pull)} />
+              <PullCard pull={pull} onDelete={() => onDelete(pull)} onSell={() => onSell(pull)} />
             </motion.div>
           );
         })}
