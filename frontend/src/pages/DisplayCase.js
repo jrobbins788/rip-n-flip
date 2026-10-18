@@ -11,6 +11,7 @@ import {
 } from 'lucide-react';
 import { ensurePushSubscribed, getPushPermission, isPushSupported } from '../lib/push';
 
+import usePageMeta from '../hooks/usePageMeta';
 const API = `${process.env.REACT_APP_BACKEND_URL}/api`;
 
 const sportColors = {
@@ -22,6 +23,7 @@ const sportColors = {
 };
 
 export default function DisplayCase() {
+  usePageMeta({ title: "Display Case — Rip N' Flip", description: "Every pack you've ripped lives here. Tap a binder to fan out your pulls.", path: '/case' });
   const { user, loading: authLoading } = useAuth();
   const navigate = useNavigate();
   const [packs, setPacks] = useState([]);
