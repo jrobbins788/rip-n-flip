@@ -1638,12 +1638,20 @@ async def update_listing(listing_id: str, listing_data: ListingCreate, request: 
         raise HTTPException(status_code=404, detail="Listing not found")
     if listing["user_id"] != user["user_id"]:
         raise HTTPException(status_code=403, detail="Not authorized")
-    
-    await db.listings.update_one(
-        {"listing_id": listing_id},
-        {"$set": listing_data.model_dump()}
+
+    # A buyer may already be paying the price and card shown at checkout, or
+    # the sale may already be the record of what they bought. Editing either
+    # one rewrites that record. Only an active listing can still change.
+    result = await db.listings.update_one(
+        {"listing_id": listing_id, "user_id": user["user_id"], "status": "active"},
+        {"$set": listing_data.model_dump()},
     )
-    
+    if result.matched_count != 1:
+        raise HTTPException(
+            status_code=409,
+            detail="Only active listings can be edited. A pending checkout or completed sale keeps the original card.",
+        )
+
     updated = await db.listings.find_one({"listing_id": listing_id}, {"_id": 0})
     if isinstance(updated.get("created_at"), str):
         updated["created_at"] = datetime.fromisoformat(updated["created_at"])
@@ -1659,17 +1667,47 @@ async def delete_listing(listing_id: str, request: Request):
     if listing["user_id"] != user["user_id"]:
         raise HTTPException(status_code=403, detail="Not authorized")
 
-    # Binder cards listed via /listings/from-pull stay status=listed until this
-    # backlink is cleared. Deleting the marketplace row without releasing the
-    # pull hides the sell action forever and blocks a new listing.
-    # Sold cards stay linked so the same pull cannot be listed again.
-    if listing.get("status") != "sold" and listing.get("from_pull_id"):
+    if listing.get("status") == "sold":
+        raise HTTPException(
+            status_code=409,
+            detail="Sold listings stay up as the record of the sale.",
+        )
+    # A buyer may have claimed the card after this page rendered it as active.
+    if listing.get("status") == "pending":
+        raise HTTPException(
+            status_code=409,
+            detail="This listing is in a trade or checkout. Cancel it before deleting.",
+        )
+    open_trade = await db.trades.find_one(
+        {
+            "listing_id": listing_id,
+            "status": {"$in": ["awaiting_payment", "paid"]},
+        },
+        {"_id": 0, "trade_id": 1},
+    )
+    if open_trade:
+        raise HTTPException(
+            status_code=409,
+            detail="This listing is in a trade or checkout. Cancel it before deleting.",
+        )
+
+    # Status can flip to sold or pending between the read above and this delete.
+    result = await db.listings.delete_one(
+        {"listing_id": listing_id, "user_id": user["user_id"], "status": "active"},
+    )
+    if result.deleted_count != 1:
+        raise HTTPException(
+            status_code=409,
+            detail="Sold listings stay up as the record of the sale.",
+        )
+
+    # Unlock the binder card only after the unsold listing is actually gone.
+    # A sold listing keeps the pull linked so it cannot be listed again.
+    if listing.get("from_pull_id"):
         await db.case_pulls.update_one(
             {"pull_id": listing["from_pull_id"], "listed_listing_id": listing_id},
             {"$set": {"status": "in_collection"}, "$unset": {"listed_listing_id": ""}},
         )
-
-    await db.listings.delete_one({"listing_id": listing_id})
     return {"message": "Listing deleted"}
 
 @api_router.get("/my-listings")
@@ -2580,8 +2618,6 @@ async def trade_initiate(payload: TradeInitiate, request: Request):
     listing = await db.listings.find_one({"listing_id": payload.listing_id}, {"_id": 0})
     if not listing:
         raise HTTPException(status_code=404, detail="Listing not found")
-    if listing["status"] != "active":
-        raise HTTPException(status_code=400, detail="Listing not available")
     if listing["user_id"] == user["user_id"]:
         raise HTTPException(status_code=400, detail="Cannot trade with yourself")
 
@@ -2591,6 +2627,20 @@ async def trade_initiate(payload: TradeInitiate, request: Request):
     seller_tag = (seller.get("cash_app_tag") or "").strip().lstrip("$")
     if not seller_tag:
         raise HTTPException(status_code=400, detail="Seller hasn't set a Cash App tag yet")
+
+    # Two buyers can both read status=active before either write lands.
+    # Only a conditional claim may take the card off the market. pending_claim
+    # changes on every attempt, so a second writer cannot look like a no-op.
+    claim = await db.listings.update_one(
+        {"listing_id": payload.listing_id, "status": "active"},
+        {"$set": {"status": "pending", "pending_claim": uuid.uuid4().hex}},
+    )
+    if claim.modified_count != 1:
+        raise HTTPException(status_code=400, detail="Listing not available")
+
+    fresh = await db.listings.find_one({"listing_id": payload.listing_id}, {"_id": 0})
+    if fresh:
+        listing = fresh
 
     base_price = float(listing["price"])
     platform_fee = round(base_price * (PLATFORM_FEE_PERCENT / 100), 2)
@@ -2618,13 +2668,14 @@ async def trade_initiate(payload: TradeInitiate, request: Request):
         "created_at": now_iso,
         "updated_at": now_iso,
     }
-    await db.trades.insert_one(dict(trade_doc))
-
-    # Flag listing as pending
-    await db.listings.update_one(
-        {"listing_id": payload.listing_id},
-        {"$set": {"status": "pending"}}
-    )
+    try:
+        await db.trades.insert_one(dict(trade_doc))
+    except Exception:
+        await db.listings.update_one(
+            {"listing_id": payload.listing_id, "status": "pending"},
+            {"$set": {"status": "active"}, "$unset": {"pending_claim": ""}},
+        )
+        raise
 
     trade_doc.pop("_id", None)
     return trade_doc
@@ -2661,14 +2712,23 @@ async def trade_confirm(trade_id: str, request: Request):
     if trade["status"] not in ("paid", "awaiting_payment"):
         raise HTTPException(status_code=400, detail=f"Can't confirm — status: {trade['status']}")
     now_iso = datetime.now(timezone.utc).isoformat()
-    await db.trades.update_one(
-        {"trade_id": trade_id},
-        {"$set": {"status": "completed", "confirmed_at": now_iso, "updated_at": now_iso}}
+    completed = await db.trades.update_one(
+        {"trade_id": trade_id, "status": {"$in": ["paid", "awaiting_payment"]}},
+        {"$set": {"status": "completed", "confirmed_at": now_iso, "updated_at": now_iso}},
     )
-    await db.listings.update_one(
-        {"listing_id": trade["listing_id"]},
-        {"$set": {"status": "sold"}}
+    if completed.modified_count != 1:
+        raise HTTPException(status_code=400, detail=f"Can't confirm — status: {trade['status']}")
+    sale = await db.listings.update_one(
+        {"listing_id": trade["listing_id"], "status": {"$in": ["pending", "active"]}},
+        {"$set": {"status": "sold"}},
     )
+    if sale.modified_count != 1:
+        # Another trade already sold this card. Don't leave this buyer thinking they won it.
+        await db.trades.update_one(
+            {"trade_id": trade_id, "status": "completed"},
+            {"$set": {"status": trade["status"], "updated_at": now_iso}},
+        )
+        raise HTTPException(status_code=409, detail="This card was already sold")
     return {"trade_id": trade_id, "status": "completed"}
 
 
@@ -2684,16 +2744,25 @@ async def trade_cancel(trade_id: str, request: Request):
     if trade["status"] == "completed":
         raise HTTPException(status_code=400, detail="Trade already completed")
     now_iso = datetime.now(timezone.utc).isoformat()
-    await db.trades.update_one(
-        {"trade_id": trade_id},
-        {"$set": {"status": "canceled", "canceled_at": now_iso, "updated_at": now_iso, "canceled_by": user["user_id"]}}
+    canceled = await db.trades.update_one(
+        {"trade_id": trade_id, "status": {"$in": ["awaiting_payment", "paid"]}},
+        {"$set": {"status": "canceled", "canceled_at": now_iso, "updated_at": now_iso, "canceled_by": user["user_id"]}},
     )
-    # Revert listing to active unless already sold
-    listing = await db.listings.find_one({"listing_id": trade["listing_id"]}, {"_id": 0})
-    if listing and listing["status"] != "sold":
+    if canceled.modified_count != 1:
+        raise HTTPException(status_code=400, detail="Trade is no longer open")
+    # Put the card back only when no other buyer still holds it.
+    other_open = await db.trades.find_one(
+        {
+            "listing_id": trade["listing_id"],
+            "trade_id": {"$ne": trade_id},
+            "status": {"$in": ["awaiting_payment", "paid"]},
+        },
+        {"_id": 0, "trade_id": 1},
+    )
+    if not other_open:
         await db.listings.update_one(
-            {"listing_id": trade["listing_id"]},
-            {"$set": {"status": "active"}}
+            {"listing_id": trade["listing_id"], "status": "pending"},
+            {"$set": {"status": "active"}, "$unset": {"pending_claim": ""}},
         )
     return {"trade_id": trade_id, "status": "canceled"}
 
@@ -3128,29 +3197,15 @@ async def admin_list_users(request: Request, limit: int = 100, offset: int = 0, 
             {"email": {"$regex": re.escape(search), "$options": "i"}},
             {"name": {"$regex": re.escape(search), "$options": "i"}},
         ]
+    from entitlements import admin_display_tier
+
     cursor = db.users.find(query, {"_id": 0, "password_hash": 0}).sort("created_at", -1).skip(offset).limit(limit)
     users = []
     now = datetime.now(timezone.utc)
     async for u in cursor:
-        created = u.get("created_at")
-        if isinstance(created, str):
-            try:
-                created_dt = datetime.fromisoformat(created)
-                if created_dt.tzinfo is None:
-                    created_dt = created_dt.replace(tzinfo=timezone.utc)
-            except ValueError:
-                created_dt = None
-        else:
-            created_dt = created
-        in_trial = bool(created_dt and (now - created_dt) <= timedelta(days=10))
         sub = u.get("subscription") or {}
         sub_status = sub.get("status")
-        if sub_status == "active":
-            tier = "pro"
-        elif in_trial:
-            tier = "trial"
-        else:
-            tier = "free"
+        tier = admin_display_tier(u, now)
         users.append({
             "user_id": u.get("user_id"),
             "email": u.get("email"),
@@ -3170,37 +3225,47 @@ async def admin_list_users(request: Request, limit: int = 100, offset: int = 0, 
 async def admin_grant_pro(user_id: str, request: Request, days: int = 30):
     """Admin: manually grant Pro access for N days (no Stripe charge — comp/promo)."""
     await require_admin(request)
+    if days < 1 or days > 3660:
+        raise HTTPException(status_code=400, detail="days must be between 1 and 3660")
     user = await db.users.find_one({"user_id": user_id}, {"_id": 0})
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
-    period_end = (datetime.now(timezone.utc) + timedelta(days=days)).isoformat()
-    await db.users.update_one(
-        {"user_id": user_id},
-        {"$set": {
-            "subscription.status": "active",
-            "subscription.granted_by_admin": True,
-            "subscription.current_period_end": period_end,
-            "subscription.granted_at": datetime.now(timezone.utc).isoformat(),
-        }}
-    )
-    return {"granted": True, "user_id": user_id, "days": days, "period_end": period_end}
+    from entitlements import build_admin_grant_update
+    now = datetime.now(timezone.utc)
+    update = build_admin_grant_update(user, days, now)
+    await db.users.update_one({"user_id": user_id}, update)
+    return {
+        "granted": True,
+        "user_id": user_id,
+        "days": days,
+        "period_end": update["$set"]["pro_until"],
+    }
 
 
 @api_router.post("/admin/users/{user_id}/revoke-pro")
 async def admin_revoke_pro(user_id: str, request: Request):
-    """Admin: revoke Pro access immediately."""
+    """Admin: revoke Pro access immediately.
+
+    Clears tier, pro_until, and the subscription window the feature gates
+    read. A later Stripe "active" webhook for the same subscription is ignored.
+    When a real Stripe subscription id is stored, cancel it so billing stops.
+    """
     await require_admin(request)
     user = await db.users.find_one({"user_id": user_id}, {"_id": 0})
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
-    await db.users.update_one(
-        {"user_id": user_id},
-        {"$set": {
-            "subscription.status": "canceled",
-            "subscription.revoked_by_admin": True,
-            "subscription.revoked_at": datetime.now(timezone.utc).isoformat(),
-        }}
-    )
+
+    sub_id = ((user.get("subscription") or {}).get("stripe_subscription_id") or "").strip()
+    stripe_key = (STRIPE_API_KEY or "").strip()
+    if sub_id and stripe_key and stripe_key != "sk_test_emergent":
+        try:
+            stripe_sdk.Subscription.cancel(sub_id)
+        except Exception as e:
+            logger.error(f"Admin revoke could not cancel Stripe subscription {sub_id}: {e}")
+
+    from entitlements import build_admin_revoke_update
+    now = datetime.now(timezone.utc)
+    await db.users.update_one({"user_id": user_id}, build_admin_revoke_update(now))
     return {"revoked": True, "user_id": user_id}
 
 
@@ -3317,42 +3382,19 @@ class CasePullCreate(BaseModel):
 
 async def _user_tier(user_id: str) -> str:
     """Return 'pro' or 'free' for a user. Pro counts when:
-      - subscription.status == 'active' (Stripe)
-      - tier == 'pro' AND pro_until is in the future (e.g. DUB STREAK reward)
+      - subscription.status == 'active' and current_period_end is still ahead
+        (a missing end date still counts, an expired one does not)
+      - tier == 'pro' AND pro_until is in the future (reward or admin comp)
       - inside 10-day signup trial
     """
+    from entitlements import signup_trial_active, user_record_is_pro
+
     user = await db.users.find_one({"user_id": user_id}, {"_id": 0})
     if not user:
         return "free"
     now = datetime.now(timezone.utc)
-
-    sub = user.get("subscription", {})
-    if sub.get("status") == "active":
+    if user_record_is_pro(user, now) or signup_trial_active(user, now):
         return "pro"
-
-    # Reward / manual Pro grant — honors pro_until window
-    if user.get("tier") == "pro":
-        pro_until = user.get("pro_until")
-        if isinstance(pro_until, str):
-            try:
-                pu = datetime.fromisoformat(pro_until)
-                if pu.tzinfo is None:
-                    pu = pu.replace(tzinfo=timezone.utc)
-                if pu > now:
-                    return "pro"
-            except ValueError:
-                return "pro"
-        else:
-            return "pro"
-
-    # Check trial: 10 days from registration
-    created = user.get("created_at")
-    if isinstance(created, str):
-        created = datetime.fromisoformat(created)
-    if created and created.tzinfo is None:
-        created = created.replace(tzinfo=timezone.utc)
-    if created and (now - created) <= timedelta(days=10):
-        return "pro"  # in trial
     return "free"
 
 

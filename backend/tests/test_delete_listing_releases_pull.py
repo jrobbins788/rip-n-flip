@@ -29,8 +29,11 @@ def _run(coro):
 def _db(listing):
     listings = AsyncMock()
     listings.find_one.return_value = listing
+    listings.delete_one.return_value = SimpleNamespace(deleted_count=1)
     pulls = AsyncMock()
-    db = SimpleNamespace(listings=listings, case_pulls=pulls)
+    trades = AsyncMock()
+    trades.find_one.return_value = None
+    db = SimpleNamespace(listings=listings, case_pulls=pulls, trades=trades)
     return db, listings, pulls
 
 
@@ -52,7 +55,11 @@ def test_delete_active_from_pull_listing_releases_binder_card(monkeypatch):
         {"pull_id": "pull_1", "listed_listing_id": "listing_abc"},
         {"$set": {"status": "in_collection"}, "$unset": {"listed_listing_id": ""}},
     )
-    listings.delete_one.assert_awaited_once_with({"listing_id": "listing_abc"})
+    listings.delete_one.assert_awaited_once_with({
+        "listing_id": "listing_abc",
+        "user_id": "user_1",
+        "status": "active",
+    })
 
 
 def test_delete_sold_from_pull_listing_keeps_pull_locked(monkeypatch):
@@ -66,10 +73,12 @@ def test_delete_sold_from_pull_listing_keeps_pull_locked(monkeypatch):
     monkeypatch.setattr(server, "db", db)
     monkeypatch.setattr(server, "require_auth", AsyncMock(return_value={"user_id": "user_1"}))
 
-    _run(server.delete_listing("listing_sold", MagicMock()))
+    with pytest.raises(HTTPException) as exc:
+        _run(server.delete_listing("listing_sold", MagicMock()))
 
+    assert exc.value.status_code == 409
     pulls.update_one.assert_not_awaited()
-    listings.delete_one.assert_awaited_once_with({"listing_id": "listing_sold"})
+    listings.delete_one.assert_not_awaited()
 
 
 def test_delete_manual_listing_does_not_touch_pulls(monkeypatch):
