@@ -13,7 +13,7 @@ import os
 import logging
 from pathlib import Path
 from typing import Optional
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timezone
 
 from dotenv import load_dotenv
 from fastapi import HTTPException, Request
@@ -140,40 +140,17 @@ async def require_admin(request: Request) -> dict:
 async def user_tier(user_id: str) -> str:
     """Return 'pro' if user is on a paid plan, inside their 10-day trial, OR
     inside a DUB STREAK weekly reward window. Otherwise 'free'.
+
+    An active subscription only counts through current_period_end when that
+    timestamp is stored. Admin comps and rewards only count through pro_until.
     """
+    from entitlements import signup_trial_active, user_record_is_pro
+
     u = await db.users.find_one({"user_id": user_id}, {"_id": 0})
     if not u:
         return "free"
 
     now = datetime.now(timezone.utc)
-
-    # 1) Explicit Pro (Stripe-active subscription) — only valid if still active.
-    #    If pro_until is set, check it hasn't lapsed.
-    if u.get("tier") == "pro":
-        pro_until = u.get("pro_until")
-        if isinstance(pro_until, str):
-            try:
-                pu = datetime.fromisoformat(pro_until)
-                if pu.tzinfo is None:
-                    pu = pu.replace(tzinfo=timezone.utc)
-                if pu > now:
-                    return "pro"
-                # Expired reward / lapsed sub — fall through to trial check
-            except ValueError:
-                return "pro"
-        else:
-            return "pro"
-
-    # 2) 10-day signup trial
-    created = u.get("created_at")
-    if isinstance(created, str):
-        try:
-            created = datetime.fromisoformat(created)
-        except ValueError:
-            created = None
-    if created and getattr(created, "tzinfo", None) is None:
-        created = created.replace(tzinfo=timezone.utc)
-    if created and (now - created) <= timedelta(days=TRIAL_DURATION_DAYS):
+    if user_record_is_pro(u, now) or signup_trial_active(u, now):
         return "pro"
-
     return "free"
