@@ -1840,7 +1840,13 @@ async def stripe_webhook(request: Request):
         session = stripe_sdk.checkout.Session.retrieve(session_id)
     except Exception as e:
         logger.warning(f"Marketplace webhook could not retrieve session {session_id}: {e}")
-        raise HTTPException(status_code=400, detail="unknown_session")
+        # A missing session is permanent. A timeout or 5xx must be retried by Stripe,
+        # or a paid checkout never gets marked sold.
+        status = getattr(e, "http_status", None)
+        code = getattr(e, "code", None)
+        if status == 404 or code == "resource_missing":
+            raise HTTPException(status_code=400, detail="unknown_session")
+        raise HTTPException(status_code=503, detail="stripe_unavailable")
 
     payment_status = session.get("payment_status") if hasattr(session, "get") else None
     metadata = session.get("metadata") if hasattr(session, "get") else None

@@ -93,11 +93,21 @@ def test_paid_stripe_session_marks_only_the_stored_listing():
     )
 
 
+class _MissingSession(Exception):
+    http_status = 404
+    code = "resource_missing"
+
+
+class _StripeDown(Exception):
+    http_status = None
+    code = None
+
+
 def test_unknown_session_does_not_update_listings():
     mock_db = _mock_db()
 
     def _boom(session_id):
-        raise RuntimeError(f"no such session {session_id}")
+        raise _MissingSession(f"no such session {session_id}")
 
     with patch("server.db", mock_db), patch.object(
         server.stripe_sdk.checkout.Session, "retrieve", side_effect=_boom
@@ -118,6 +128,31 @@ def test_unknown_session_does_not_update_listings():
 
     assert resp.status_code == 400
     mock_db.listings.update_one.assert_not_called()
+
+
+def test_stripe_outage_does_not_mark_sold_and_asks_for_retry():
+    mock_db = _mock_db()
+
+    with patch("server.db", mock_db), patch.object(
+        server.stripe_sdk.checkout.Session, "retrieve", side_effect=_StripeDown("down")
+    ), TestClient(server.app) as client:
+        resp = client.post(
+            "/api/webhook/stripe",
+            json={
+                "type": "checkout.session.completed",
+                "data": {
+                    "object": {
+                        "id": "cs_test_paid",
+                        "payment_status": "paid",
+                        "metadata": {"listing_id": "listing_victim"},
+                    }
+                },
+            },
+        )
+
+    assert resp.status_code == 503
+    mock_db.listings.update_one.assert_not_called()
+    mock_db.payment_transactions.update_one.assert_not_called()
 
 
 def test_non_checkout_event_is_ignored():
