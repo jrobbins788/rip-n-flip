@@ -22,6 +22,38 @@ def _as_mapping(sub: Any) -> Optional[dict]:
     return None
 
 
+def _positive_unix(value: Any) -> Optional[int]:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    if value <= 0:
+        return None
+    return int(value)
+
+
+def _period_end_unix(data: dict) -> Optional[int]:
+    """Stripe API 2025-03-31+ stores current_period_end on the subscription item.
+
+    Older API versions still send it on the subscription. stripe-python 14
+    requests 2026-01-28.clover, which only returns the item field. Without
+    that timestamp an active subscription would not set pro_until.
+    """
+    top = _positive_unix(data.get("current_period_end"))
+    if top is not None:
+        return top
+    items = data.get("items")
+    rows = items.get("data") if isinstance(items, dict) else None
+    if not isinstance(rows, list):
+        return None
+    ends = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        parsed = _positive_unix(row.get("current_period_end"))
+        if parsed is not None:
+            ends.append(parsed)
+    return max(ends) if ends else None
+
+
 def subscription_write_from_stripe(sub: Any) -> Optional[dict]:
     """Return ``{"customer_id", "set"}`` or None when nothing may be written.
 
@@ -45,10 +77,10 @@ def subscription_write_from_stripe(sub: Any) -> Optional[dict]:
     if not isinstance(sub_id, str) or not sub_id.startswith("sub_"):
         return None
 
-    period_end = data.get("current_period_end")
+    period_end = _period_end_unix(data)
     period_end_iso = None
-    if isinstance(period_end, (int, float)) and not isinstance(period_end, bool) and period_end > 0:
-        period_end_iso = datetime.fromtimestamp(int(period_end), tz=timezone.utc).isoformat()
+    if period_end is not None:
+        period_end_iso = datetime.fromtimestamp(period_end, tz=timezone.utc).isoformat()
 
     fields = {
         "subscription.status": "canceled" if status == "canceled" else status,

@@ -72,6 +72,27 @@ def test_retrieved_canceled_subscription_clears_pro():
     assert "pro_until" not in decision["set"]
 
 
+def test_period_end_on_the_subscription_item_still_grants_pro():
+    """stripe-python 14 / API 2026-01-28.clover omits subscription.current_period_end."""
+    decision = subscription_write_from_stripe({
+        "id": "sub_real",
+        "customer": "cus_real",
+        "status": "active",
+        "cancel_at_period_end": False,
+        "items": {
+            "object": "list",
+            "data": [
+                {"id": "si_old", "current_period_end": PERIOD_END - 100},
+                {"id": "si_current", "current_period_end": PERIOD_END},
+            ],
+        },
+    })
+    assert decision["customer_id"] == "cus_real"
+    assert decision["set"]["tier"] == "pro"
+    assert decision["set"]["pro_until"] == PERIOD_END_ISO
+    assert decision["set"]["subscription.current_period_end"] == PERIOD_END_ISO
+
+
 def test_past_due_does_not_grant_pro():
     decision = subscription_write_from_stripe({
         "id": "sub_real",
