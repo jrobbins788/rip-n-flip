@@ -479,19 +479,30 @@ def test_stripe_failure_releases_the_claim():
     assert updates[1][0]["pending_since"] == updates[0][1]["$set"]["pending_since"]
 
 
-def test_expired_status_poll_only_reopens_a_pending_listing():
-    server = _load_server()
-    mock_db = SimpleNamespace(
+def _status_poll_db(transaction, newer=None, trade=None):
+    async def find_txn(query, projection=None):
+        if query.get("session_id") == transaction["session_id"]:
+            return transaction
+        return newer
+
+    return SimpleNamespace(
         payment_transactions=SimpleNamespace(
-            find_one=AsyncMock(return_value={
-                "session_id": "cs_expired",
-                "listing_id": "listing_sold_later",
-                "payment_status": "unpaid",
-            }),
+            find_one=find_txn,
             update_one=AsyncMock(),
         ),
         listings=SimpleNamespace(update_one=AsyncMock()),
+        trades=SimpleNamespace(find_one=AsyncMock(return_value=trade)),
     )
+
+
+def test_expired_status_poll_only_reopens_a_pending_listing():
+    server = _load_server()
+    mock_db = _status_poll_db({
+        "session_id": "cs_expired",
+        "listing_id": "listing_sold_later",
+        "payment_status": "unpaid",
+        "created_at": "2026-10-01T00:00:00+00:00",
+    })
 
     class FakeStripe:
         def __init__(self, api_key, webhook_url):
@@ -512,3 +523,63 @@ def test_expired_status_poll_only_reopens_a_pending_listing():
         {"listing_id": "listing_sold_later", "status": "pending"},
         {"$set": {"status": "active"}, "$unset": {"pending_since": ""}},
     )
+
+
+def test_expired_status_poll_does_not_release_a_newer_checkout():
+    server = _load_server()
+    mock_db = _status_poll_db(
+        {
+            "session_id": "cs_expired",
+            "listing_id": "listing_1",
+            "payment_status": "unpaid",
+            "created_at": "2026-10-01T00:00:00+00:00",
+        },
+        newer={"session_id": "cs_newer", "payment_status": "pending"},
+    )
+
+    class FakeStripe:
+        def __init__(self, api_key, webhook_url):
+            pass
+
+        async def get_checkout_status(self, session_id):
+            return SimpleNamespace(status="expired", payment_status="unpaid", amount_total=20.0, currency="usd")
+
+    from fastapi.testclient import TestClient
+
+    with patch.object(server, "db", mock_db), patch.object(
+        server, "StripeCheckout", FakeStripe
+    ), TestClient(server.app) as client:
+        resp = client.get("/api/payments/status/cs_expired")
+
+    assert resp.status_code == 200
+    mock_db.listings.update_one.assert_not_called()
+
+
+def test_expired_status_poll_does_not_release_an_open_trade():
+    server = _load_server()
+    mock_db = _status_poll_db(
+        {
+            "session_id": "cs_expired",
+            "listing_id": "listing_1",
+            "payment_status": "unpaid",
+            "created_at": "2026-10-01T00:00:00+00:00",
+        },
+        trade={"trade_id": "trade_open"},
+    )
+
+    class FakeStripe:
+        def __init__(self, api_key, webhook_url):
+            pass
+
+        async def get_checkout_status(self, session_id):
+            return SimpleNamespace(status="expired", payment_status="unpaid", amount_total=20.0, currency="usd")
+
+    from fastapi.testclient import TestClient
+
+    with patch.object(server, "db", mock_db), patch.object(
+        server, "StripeCheckout", FakeStripe
+    ), TestClient(server.app) as client:
+        resp = client.get("/api/payments/status/cs_expired")
+
+    assert resp.status_code == 200
+    mock_db.listings.update_one.assert_not_called()

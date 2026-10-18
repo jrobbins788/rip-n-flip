@@ -5,6 +5,7 @@ import io
 import base64
 from dotenv import load_dotenv
 from cors_config import install_cors
+from checkout_holds import reconcile_abandoned_checkouts
 from motor.motor_asyncio import AsyncIOMotorClient
 import os
 import json
@@ -21,7 +22,6 @@ import httpx
 from bs4 import BeautifulSoup
 import stripe as stripe_sdk
 from emergentintegrations.payments.stripe.checkout import StripeCheckout, CheckoutSessionResponse, CheckoutStatusResponse, CheckoutSessionRequest
-from checkout_holds import reconcile_abandoned_checkouts
 
 ROOT_DIR = Path(__file__).parent
 load_dotenv(ROOT_DIR / '.env')
@@ -1821,13 +1821,32 @@ async def get_payment_status(session_id: str, request: Request):
                 {"listing_id": transaction["listing_id"]},
                 {"$set": {"status": "sold"}, "$unset": {"pending_since": ""}}
             )
-        # Only a still-pending listing can be returned to the market. Matching
-        # on status avoids reopening a listing another checkout already sold.
+        # Only this session's still-pending hold can be returned to the market.
+        # A newer checkout or an open Cash App trade may already own the card.
         elif session_over:
-            await db.listings.update_one(
-                {"listing_id": transaction["listing_id"], "status": "pending"},
-                {"$set": {"status": "active"}, "$unset": {"pending_since": ""}}
+            newer_query = {
+                "listing_id": transaction["listing_id"],
+                "session_id": {"$ne": session_id},
+                "payment_status": {"$nin": ["expired", "failed"]},
+            }
+            created_at = transaction.get("created_at")
+            if isinstance(created_at, str) and created_at:
+                newer_query["created_at"] = {"$gt": created_at}
+            newer_hold = await db.payment_transactions.find_one(
+                newer_query, {"_id": 0, "session_id": 1}
             )
+            open_trade = await db.trades.find_one(
+                {
+                    "listing_id": transaction["listing_id"],
+                    "status": {"$in": ["awaiting_payment", "paid"]},
+                },
+                {"_id": 0, "trade_id": 1},
+            )
+            if not newer_hold and not open_trade:
+                await db.listings.update_one(
+                    {"listing_id": transaction["listing_id"], "status": "pending"},
+                    {"$set": {"status": "active"}, "$unset": {"pending_since": ""}},
+                )
     
     return {
         "status": status.status,
