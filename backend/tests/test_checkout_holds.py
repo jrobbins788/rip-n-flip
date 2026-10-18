@@ -479,6 +479,86 @@ def test_stripe_failure_releases_the_claim():
     assert updates[1][0]["pending_since"] == updates[0][1]["$set"]["pending_since"]
 
 
+def test_checkout_does_not_charge_for_a_card_swapped_before_claim():
+    """Seller edits the card after the buyer reads it and before the claim lands.
+
+    The charge must not open. The listing goes back on sale as the new card.
+    """
+    server = _load_server()
+    updates = []
+    seen = {"n": 0}
+
+    original = {
+        "listing_id": "listing_1",
+        "user_id": "seller",
+        "seller_name": "Seller",
+        "title": "Wemby Prizm",
+        "description": "Raw rookie",
+        "price": 500,
+        "images": ["https://cdn.example/wemby.jpg"],
+        "player_name": "Wembanyama",
+        "condition": "Near Mint",
+        "sport": "NBA",
+        "card_type": "Rookie",
+        "status": "active",
+    }
+    swapped = {
+        **original,
+        "title": "Bulk commons",
+        "description": "Lot of 50",
+        "price": 5,
+        "images": ["https://cdn.example/commons.jpg"],
+        "player_name": "Assorted",
+        "status": "pending",
+    }
+
+    async def find_one(query, projection=None):
+        seen["n"] += 1
+        if seen["n"] == 1:
+            return dict(original)
+        return dict(swapped)
+
+    async def update_one(query, update):
+        updates.append((query, update))
+        return SimpleNamespace(modified_count=1)
+
+    mock_db = SimpleNamespace(
+        listings=SimpleNamespace(find_one=find_one, update_one=update_one),
+        payment_transactions=SimpleNamespace(insert_one=AsyncMock()),
+    )
+    stripe_called = {"n": 0}
+
+    class FakeStripe:
+        def __init__(self, api_key, webhook_url):
+            pass
+
+        async def create_checkout_session(self, request):
+            stripe_called["n"] += 1
+            return SimpleNamespace(session_id="cs_should_not_exist", url="https://pay.example")
+
+    async def buyer(_request):
+        return {"user_id": "buyer", "name": "Buyer", "email": "buyer@example.com"}
+
+    from fastapi.testclient import TestClient
+
+    with patch.object(server, "db", mock_db), patch.object(
+        server, "reconcile_abandoned_checkouts", new=AsyncMock(return_value=[])
+    ), patch.object(server, "get_current_user", buyer), patch.object(
+        server, "StripeCheckout", FakeStripe
+    ), TestClient(server.app) as client:
+        resp = client.post(
+            "/api/payments/checkout",
+            json={"listing_id": "listing_1", "origin_url": "https://app.example"},
+        )
+
+    assert resp.status_code == 409
+    assert stripe_called["n"] == 0
+    mock_db.payment_transactions.insert_one.assert_not_called()
+    assert updates[0][1]["$set"]["status"] == "pending"
+    assert updates[1][1]["$set"]["status"] == "active"
+    assert updates[1][0]["pending_since"] == updates[0][1]["$set"]["pending_since"]
+
+
 def _status_poll_db(transaction, newer=None, trade=None):
     async def find_txn(query, projection=None):
         if query.get("session_id") == transaction["session_id"]:
