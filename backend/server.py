@@ -5,6 +5,7 @@ import io
 import base64
 from dotenv import load_dotenv
 from cors_config import install_cors
+from checkout_holds import reconcile_abandoned_checkouts
 from motor.motor_asyncio import AsyncIOMotorClient
 import os
 import json
@@ -1584,6 +1585,7 @@ async def get_listings(
             {"description": {"$regex": search, "$options": "i"}}
         ]
     
+    await _reconcile_checkout_holds()
     listings = await db.listings.find(query, {"_id": 0}).sort("created_at", -1).skip(skip).limit(limit).to_list(limit)
     
     for listing in listings:
@@ -1594,6 +1596,7 @@ async def get_listings(
 
 @api_router.get("/listings/{listing_id}")
 async def get_listing(listing_id: str):
+    await _reconcile_checkout_holds()
     listing = await db.listings.find_one({"listing_id": listing_id}, {"_id": 0})
     if not listing:
         raise HTTPException(status_code=404, detail="Listing not found")
@@ -1641,6 +1644,7 @@ async def delete_listing(listing_id: str, request: Request):
 @api_router.get("/my-listings")
 async def get_my_listings(request: Request):
     user = await require_auth(request)
+    await _reconcile_checkout_holds()
     listings = await db.listings.find({"user_id": user["user_id"]}, {"_id": 0}).sort("created_at", -1).to_list(100)
     for listing in listings:
         if isinstance(listing.get("created_at"), str):
@@ -1701,32 +1705,57 @@ async def get_conversation(other_user_id: str, request: Request):
 
 PLATFORM_FEE_PERCENT = 2.0  # 2% platform fee on every successful sale
 
+def _retrieve_marketplace_session(session_id: str):
+    return stripe_sdk.checkout.Session.retrieve(session_id)
+
+
+async def _reconcile_checkout_holds() -> None:
+    """Best-effort. A Stripe or DB hiccup must not take the marketplace down."""
+    try:
+        released = await reconcile_abandoned_checkouts(db, _retrieve_marketplace_session)
+        if released:
+            logger.info(f"Released abandoned checkout holds: {released}")
+    except Exception as exc:
+        logger.warning(f"Abandoned checkout reconcile failed: {exc}")
+
+
 @api_router.post("/payments/checkout")
 async def create_checkout(checkout_data: CheckoutRequest, request: Request):
     user = await require_auth(request)
-    
+    await _reconcile_checkout_holds()
+
     # Get the listing
     listing = await db.listings.find_one({"listing_id": checkout_data.listing_id}, {"_id": 0})
     if not listing:
         raise HTTPException(status_code=404, detail="Listing not found")
-    
+
     if listing["status"] != "active":
         raise HTTPException(status_code=400, detail="Listing is not available")
-    
+
     # Calculate total with platform fee
     base_price = float(listing["price"])
     platform_fee = base_price * (PLATFORM_FEE_PERCENT / 100)
     total_amount = base_price + platform_fee
-    
+
+    # Claim the listing before talking to Stripe. Two buyers used to both
+    # pass the status check, both pay, and one card was sold twice.
+    pending_since = datetime.now(timezone.utc).isoformat()
+    claim = await db.listings.update_one(
+        {"listing_id": checkout_data.listing_id, "status": "active"},
+        {"$set": {"status": "pending", "pending_since": pending_since}},
+    )
+    if claim.modified_count != 1:
+        raise HTTPException(status_code=400, detail="Listing is not available")
+
     # Build URLs from frontend origin
     success_url = f"{checkout_data.origin_url}/payment-success?session_id={{CHECKOUT_SESSION_ID}}"
     cancel_url = f"{checkout_data.origin_url}/marketplace/{checkout_data.listing_id}"
-    
+
     # Create Stripe checkout
     host_url = str(request.base_url)
     webhook_url = f"{host_url}api/webhook/stripe"
     stripe_checkout = StripeCheckout(api_key=STRIPE_API_KEY, webhook_url=webhook_url)
-    
+
     checkout_request = CheckoutSessionRequest(
         amount=total_amount,
         currency="usd",
@@ -1741,31 +1770,30 @@ async def create_checkout(checkout_data: CheckoutRequest, request: Request):
         },
         payment_methods=["card", "klarna", "afterpay_clearpay", "affirm"]
     )
-    
-    session: CheckoutSessionResponse = await stripe_checkout.create_checkout_session(checkout_request)
-    
-    # Create payment transaction record
-    transaction_doc = {
-        "transaction_id": f"txn_{uuid.uuid4().hex[:12]}",
-        "session_id": session.session_id,
-        "listing_id": checkout_data.listing_id,
-        "buyer_id": user["user_id"],
-        "seller_id": listing["user_id"],
-        "amount": total_amount,
-        "base_price": base_price,
-        "platform_fee": platform_fee,
-        "currency": "usd",
-        "payment_status": "pending",
-        "created_at": datetime.now(timezone.utc).isoformat()
-    }
-    await db.payment_transactions.insert_one(transaction_doc)
-    
-    # Mark listing as pending
-    await db.listings.update_one(
-        {"listing_id": checkout_data.listing_id},
-        {"$set": {"status": "pending"}}
-    )
-    
+
+    try:
+        session: CheckoutSessionResponse = await stripe_checkout.create_checkout_session(checkout_request)
+        transaction_doc = {
+            "transaction_id": f"txn_{uuid.uuid4().hex[:12]}",
+            "session_id": session.session_id,
+            "listing_id": checkout_data.listing_id,
+            "buyer_id": user["user_id"],
+            "seller_id": listing["user_id"],
+            "amount": total_amount,
+            "base_price": base_price,
+            "platform_fee": platform_fee,
+            "currency": "usd",
+            "payment_status": "pending",
+            "created_at": datetime.now(timezone.utc).isoformat()
+        }
+        await db.payment_transactions.insert_one(transaction_doc)
+    except Exception:
+        await db.listings.update_one(
+            {"listing_id": checkout_data.listing_id, "status": "pending", "pending_since": pending_since},
+            {"$set": {"status": "active"}, "$unset": {"pending_since": ""}},
+        )
+        raise
+
     return {"url": session.url, "session_id": session.session_id}
 
 @api_router.get("/payments/status/{session_id}")
@@ -1779,24 +1807,49 @@ async def get_payment_status(session_id: str, request: Request):
     # Update transaction in database
     transaction = await db.payment_transactions.find_one({"session_id": session_id}, {"_id": 0})
     
-    if transaction and transaction["payment_status"] != status.payment_status:
-        await db.payment_transactions.update_one(
-            {"session_id": session_id},
-            {"$set": {"payment_status": status.payment_status, "status": status.status}}
-        )
-        
+    session_over = status.status in ("expired", "failed")
+    if transaction and transaction.get("listing_id") and (
+        transaction["payment_status"] != status.payment_status
+        or (session_over and transaction["payment_status"] != "paid")
+    ):
+        if transaction["payment_status"] != status.payment_status:
+            await db.payment_transactions.update_one(
+                {"session_id": session_id},
+                {"$set": {"payment_status": status.payment_status, "status": status.status}}
+            )
+
         # If paid, mark listing as sold
         if status.payment_status == "paid":
             await db.listings.update_one(
                 {"listing_id": transaction["listing_id"]},
-                {"$set": {"status": "sold"}}
+                {"$set": {"status": "sold"}, "$unset": {"pending_since": ""}}
             )
-        # If expired/failed, revert listing to active
-        elif status.status in ["expired", "failed"]:
-            await db.listings.update_one(
-                {"listing_id": transaction["listing_id"]},
-                {"$set": {"status": "active"}}
+        # Only this session's still-pending hold can be returned to the market.
+        # A newer checkout or an open Cash App trade may already own the card.
+        elif session_over:
+            newer_query = {
+                "listing_id": transaction["listing_id"],
+                "session_id": {"$ne": session_id},
+                "payment_status": {"$nin": ["expired", "failed"]},
+            }
+            created_at = transaction.get("created_at")
+            if isinstance(created_at, str) and created_at:
+                newer_query["created_at"] = {"$gt": created_at}
+            newer_hold = await db.payment_transactions.find_one(
+                newer_query, {"_id": 0, "session_id": 1}
             )
+            open_trade = await db.trades.find_one(
+                {
+                    "listing_id": transaction["listing_id"],
+                    "status": {"$in": ["awaiting_payment", "paid"]},
+                },
+                {"_id": 0, "trade_id": 1},
+            )
+            if not newer_hold and not open_trade:
+                await db.listings.update_one(
+                    {"listing_id": transaction["listing_id"], "status": "pending"},
+                    {"$set": {"status": "active"}, "$unset": {"pending_since": ""}},
+                )
     
     return {
         "status": status.status,
