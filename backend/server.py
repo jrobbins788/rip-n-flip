@@ -1611,12 +1611,20 @@ async def update_listing(listing_id: str, listing_data: ListingCreate, request: 
         raise HTTPException(status_code=404, detail="Listing not found")
     if listing["user_id"] != user["user_id"]:
         raise HTTPException(status_code=403, detail="Not authorized")
-    
-    await db.listings.update_one(
-        {"listing_id": listing_id},
-        {"$set": listing_data.model_dump()}
+
+    # A buyer may already be paying the price and card shown at checkout, or
+    # the sale may already be the record of what they bought. Editing either
+    # one rewrites that record. Only an active listing can still change.
+    result = await db.listings.update_one(
+        {"listing_id": listing_id, "user_id": user["user_id"], "status": "active"},
+        {"$set": listing_data.model_dump()},
     )
-    
+    if result.matched_count != 1:
+        raise HTTPException(
+            status_code=409,
+            detail="Only active listings can be edited. A pending checkout or completed sale keeps the original card.",
+        )
+
     updated = await db.listings.find_one({"listing_id": listing_id}, {"_id": 0})
     if isinstance(updated.get("created_at"), str):
         updated["created_at"] = datetime.fromisoformat(updated["created_at"])
@@ -1632,8 +1640,12 @@ async def delete_listing(listing_id: str, request: Request):
     if listing["user_id"] != user["user_id"]:
         raise HTTPException(status_code=403, detail="Not authorized")
 
+    if listing.get("status") == "sold":
+        raise HTTPException(
+            status_code=409,
+            detail="Sold listings stay up as the record of the sale.",
+        )
     # A buyer may have claimed the card after this page rendered it as active.
-    # Deleting out from under that hold leaves them paying for a removed listing.
     if listing.get("status") == "pending":
         raise HTTPException(
             status_code=409,
@@ -1652,15 +1664,23 @@ async def delete_listing(listing_id: str, request: Request):
             detail="This listing is in a trade or checkout. Cancel it before deleting.",
         )
 
-    # Binder cards listed via /listings/from-pull stay status=listed until this
-    # backlink is cleared. Sold cards stay linked so the same pull cannot be listed again.
-    if listing.get("status") != "sold" and listing.get("from_pull_id"):
+    # Status can flip to sold or pending between the read above and this delete.
+    result = await db.listings.delete_one(
+        {"listing_id": listing_id, "user_id": user["user_id"], "status": "active"},
+    )
+    if result.deleted_count != 1:
+        raise HTTPException(
+            status_code=409,
+            detail="Sold listings stay up as the record of the sale.",
+        )
+
+    # Unlock the binder card only after the unsold listing is actually gone.
+    # A sold listing keeps the pull linked so it cannot be listed again.
+    if listing.get("from_pull_id"):
         await db.case_pulls.update_one(
             {"pull_id": listing["from_pull_id"], "listed_listing_id": listing_id},
             {"$set": {"status": "in_collection"}, "$unset": {"listed_listing_id": ""}},
         )
-
-    await db.listings.delete_one({"listing_id": listing_id})
     return {"message": "Listing deleted"}
 
 @api_router.get("/my-listings")
