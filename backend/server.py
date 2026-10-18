@@ -7,6 +7,7 @@ from dotenv import load_dotenv
 from cors_config import install_cors
 from checkout_holds import reconcile_abandoned_checkouts
 from motor.motor_asyncio import AsyncIOMotorClient
+from services.db_guard import mongo_client_kwargs
 import os
 import json
 import logging
@@ -29,7 +30,7 @@ load_dotenv(ROOT_DIR / '.env')
 
 # MongoDB connection
 mongo_url = os.environ['MONGO_URL']
-client = AsyncIOMotorClient(mongo_url)
+client = AsyncIOMotorClient(mongo_url, **mongo_client_kwargs())
 db = client[os.environ['DB_NAME']]
 
 # JWT Config
@@ -2528,48 +2529,23 @@ async def _ebay_html_scrape(query: str, sold_only: bool = False) -> dict:
 
 @api_router.get("/packs/price")
 async def get_pack_price(q: str, sold: bool = False, refresh: bool = False):
-    """Get live price data for a search query (pack name, player, etc). Cached 60min."""
+    """Get live price data for a search query (pack name, player, etc). Cached 60min.
+
+    The cache is best-effort. A Mongo outage still returns the eBay payload,
+    or a blocked empty payload the homepage can fall back from.
+    """
     if not q or len(q.strip()) < 2:
         raise HTTPException(status_code=400, detail="Query required")
-    cache_key = f"{q.strip().lower()}|sold={sold}"
-    now = datetime.now(timezone.utc)
-
-    if not refresh:
-        cached = await db.price_cache.find_one({"cache_key": cache_key}, {"_id": 0})
-        if cached:
-            fetched_at = cached.get("fetched_at")
-            if isinstance(fetched_at, str):
-                fetched_at = datetime.fromisoformat(fetched_at)
-            if fetched_at.tzinfo is None:
-                fetched_at = fetched_at.replace(tzinfo=timezone.utc)
-            if now - fetched_at < timedelta(minutes=PRICE_CACHE_TTL_MINUTES):
-                data = cached["data"]
-                data["cached"] = True
-                data["fetched_at"] = fetched_at.isoformat()
-                return data
-
-    try:
-        data = await _scrape_ebay_prices(q.strip(), sold_only=sold)
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.exception(f"Scrape error for '{q}': {e}")
-        raise HTTPException(status_code=502, detail=f"Price scrape failed: {type(e).__name__}: {str(e) or repr(e)}")
-
-    await db.price_cache.update_one(
-        {"cache_key": cache_key},
-        {"$set": {
-            "cache_key": cache_key,
-            "query": q.strip(),
-            "sold_only": sold,
-            "data": data,
-            "fetched_at": now.isoformat(),
-        }},
-        upsert=True,
+    from services.public_reads import resolve_pack_price
+    return await resolve_pack_price(
+        db=db,
+        query=q,
+        sold=sold,
+        refresh=refresh,
+        scrape=_scrape_ebay_prices,
+        now=datetime.now(timezone.utc),
+        ttl=timedelta(minutes=PRICE_CACHE_TTL_MINUTES),
     )
-    data["cached"] = False
-    data["fetched_at"] = now.isoformat()
-    return data
 
 
 @api_router.post("/packs/prices/batch")
