@@ -294,3 +294,42 @@ def test_deleting_a_binder_with_a_pending_sale_is_rejected(db):
     assert len(db.case_packs.docs) == 1
     assert len(db.case_pulls.docs) == 1
     assert db.listings.docs[0]["status"] == "pending"
+
+
+def test_deleting_a_binder_withdraws_a_listing_past_the_first_page(db):
+    """The old delete loaded 1000 pulls. A later listed card stayed buyable."""
+    pulls = [_pull(pull_id=f"pull_{i}") for i in range(1000)]
+    pulls.append(_pull(pull_id="pull_listed", listed_listing_id="listing_late", status="listed"))
+    db.case_pulls.docs.extend(pulls)
+    db.listings.docs.append({"listing_id": "listing_late", "status": "active", "price": 80})
+
+    result = _run(server.case_delete_pack("binder_1", None))
+
+    assert result == {"deleted": True}
+    assert db.case_packs.docs == []
+    assert db.case_pulls.docs == []
+    assert db.listings.docs == []
+
+
+def test_checkout_that_starts_during_binder_delete_keeps_the_card(db):
+    """A buyer can claim the card after the pending check and before the delete."""
+    db.case_pulls.docs.append(_pull(listed_listing_id="listing_live", status="listed"))
+    db.listings.docs.append({"listing_id": "listing_live", "status": "active", "price": 40})
+    original_delete = db.listings.delete_one
+
+    async def claim_then_delete(query):
+        for doc in db.listings.docs:
+            if doc.get("listing_id") == "listing_live":
+                doc["status"] = "pending"
+        return await original_delete(query)
+
+    db.listings.delete_one = claim_then_delete
+
+    with pytest.raises(HTTPException) as raised:
+        _run(server.case_delete_pack("binder_1", None))
+
+    assert raised.value.status_code == 409
+    assert len(db.case_packs.docs) == 1
+    assert db.case_pulls.docs[0]["pull_id"] == "pull_1"
+    assert db.listings.docs[0]["status"] == "pending"
+    assert db.listings.docs[0]["listing_id"] == "listing_live"
