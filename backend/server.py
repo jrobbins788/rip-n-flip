@@ -3503,6 +3503,13 @@ async def case_list_packs(request: Request):
     return {"packs": items, "tier": tier}
 
 
+async def _collect_all(cursor) -> list:
+    """Read every row. Motor cursors iterate; the unit-test cursor only has to_list."""
+    if hasattr(cursor, "__aiter__"):
+        return [row async for row in cursor]
+    return await cursor.to_list(10**9)
+
+
 async def _withdraw_active_listing(listing_id: Optional[str]) -> None:
     """Take an unsold active listing off the market.
 
@@ -3541,23 +3548,27 @@ async def case_delete_pack(case_pack_id: str, request: Request):
         raise HTTPException(status_code=404, detail="Pack not in your case")
     if pack["user_id"] != user["user_id"]:
         raise HTTPException(status_code=403, detail="Not your pack")
-    pulls = await db.case_pulls.find(
+    # A capped page would leave a later listing on the market after this binder
+    # is gone. Walk every pull, and use the same checkout re-check as deleting
+    # one card so a sale that starts mid-delete keeps the binder and the pull.
+    pulls = await _collect_all(db.case_pulls.find(
         {"case_pack_id": case_pack_id}, {"_id": 0, "listed_listing_id": 1}
-    ).to_list(1000)
+    ))
+    in_checkout = "A card in this binder is in an active checkout and can't be removed yet"
     for pull in pulls:
         listing_id = pull.get("listed_listing_id")
         if not listing_id:
             continue
         listing = await db.listings.find_one({"listing_id": listing_id}, {"_id": 0, "status": 1})
         if listing and listing.get("status") == "pending":
-            raise HTTPException(
-                status_code=409,
-                detail="A card in this binder is in an active checkout and can't be removed yet",
-            )
+            raise HTTPException(status_code=409, detail=in_checkout)
     for pull in pulls:
-        listing_id = pull.get("listed_listing_id")
-        if listing_id:
-            await db.listings.delete_one({"listing_id": listing_id, "status": "active"})
+        try:
+            await _withdraw_active_listing(pull.get("listed_listing_id"))
+        except HTTPException as exc:
+            if exc.status_code == 409:
+                raise HTTPException(status_code=409, detail=in_checkout) from exc
+            raise
     await db.case_packs.delete_one({"case_pack_id": case_pack_id})
     await db.case_pulls.delete_many({"case_pack_id": case_pack_id})
     return {"deleted": True}
