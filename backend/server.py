@@ -275,16 +275,32 @@ async def process_session(request: Request, response: Response):
             raise HTTPException(status_code=401, detail="Invalid session")
         
         oauth_data = resp.json()
-    
+
     email = oauth_data.get("email")
     name = oauth_data.get("name")
     picture = oauth_data.get("picture")
     session_token = oauth_data.get("session_token")
-    
+    # The provider response is the only identity proof. A missing email used to
+    # match every user document with no email and log those people into one account.
+    if not isinstance(email, str) or not email.strip():
+        raise HTTPException(status_code=401, detail="Invalid session")
+    if not isinstance(session_token, str) or not session_token:
+        raise HTTPException(status_code=401, detail="Invalid session")
+    email = email.strip()
+
     # Check if user exists
     existing_user = await db.users.find_one({"email": email}, {"_id": 0})
-    
+
     if existing_user:
+        # Register does not verify the address, so anyone can create a password
+        # account for an email they do not own. Linking Google onto that account
+        # signs the real owner in while the password still works, and the
+        # registrant keeps the Cash App tag, listings, and trades the owner adds.
+        if existing_user.get("password_hash"):
+            raise HTTPException(
+                status_code=409,
+                detail="An account with this email already exists. Log in with your password.",
+            )
         user_id = existing_user["user_id"]
         # Update user info
         await db.users.update_one(
