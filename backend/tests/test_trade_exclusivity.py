@@ -241,6 +241,71 @@ def test_second_confirm_does_not_complete_after_the_card_is_sold():
     assert statuses["trade_b"] == "awaiting_payment"
 
 
+def test_mark_paid_marks_an_open_trade_paid():
+    listings = FakeCollection([{**_listing(), "status": "pending"}])
+    trades = FakeCollection([
+        {
+            "trade_id": "trade_a",
+            "listing_id": "listing_1",
+            "buyer_id": "buyer_a",
+            "seller_id": "seller_1",
+            "status": "awaiting_payment",
+        },
+    ])
+    db = FakeDb(listings, trades, _users())
+
+    async def scenario():
+        _use(db, _buyer("buyer_a", "Buyer A"))
+        return await server.trade_mark_paid("trade_a", SimpleNamespace())
+
+    import asyncio
+    result = asyncio.run(scenario())
+    assert result == {"trade_id": "trade_a", "status": "paid"}
+    assert trades.docs[0]["status"] == "paid"
+    assert listings.docs[0]["status"] == "pending"
+
+
+def test_mark_paid_does_not_revive_a_trade_canceled_after_it_was_read():
+    """Cancel can commit after the buyer loaded the trade and before the write.
+
+    The card is back on sale. Reviving the trade lets the seller confirm it
+    and take the card from whoever bought it next.
+    """
+    listings = FakeCollection([_listing()])
+    trades = FakeCollection([
+        {
+            "trade_id": "trade_a",
+            "listing_id": "listing_1",
+            "buyer_id": "buyer_a",
+            "seller_id": "seller_1",
+            "status": "canceled",
+        },
+    ])
+
+    async def stale_find(query, projection=None):
+        for doc in trades.docs:
+            if _match(doc, query):
+                stale = dict(doc)
+                stale["status"] = "awaiting_payment"
+                return stale
+        return None
+
+    trades.find_one = stale_find
+    db = FakeDb(listings, trades, _users())
+
+    async def scenario():
+        _use(db, _buyer("buyer_a", "Buyer A"))
+        with pytest.raises(HTTPException) as raised:
+            await server.trade_mark_paid("trade_a", SimpleNamespace())
+        return raised.value
+
+    import asyncio
+    error = asyncio.run(scenario())
+    assert error.status_code == 400
+    assert trades.docs[0]["status"] == "canceled"
+    assert listings.docs[0]["status"] == "active"
+
+
 def test_failed_trade_insert_releases_the_claim():
     listings = FakeCollection([_listing()])
     trades = FakeCollection()
