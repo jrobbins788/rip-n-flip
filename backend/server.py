@@ -2742,10 +2742,16 @@ async def trade_mark_paid(trade_id: str, request: Request):
     if trade["status"] != "awaiting_payment":
         raise HTTPException(status_code=400, detail=f"Can't mark paid — current status: {trade['status']}")
     now_iso = datetime.now(timezone.utc).isoformat()
-    await db.trades.update_one(
-        {"trade_id": trade_id},
-        {"$set": {"status": "paid", "paid_at": now_iso, "updated_at": now_iso}}
+    # Cancel can commit after the read above. An unconditional write would
+    # revive that trade and let the seller confirm a card that is on sale again.
+    updated = await db.trades.update_one(
+        {"trade_id": trade_id, "buyer_id": user["user_id"], "status": "awaiting_payment"},
+        {"$set": {"status": "paid", "paid_at": now_iso, "updated_at": now_iso}},
     )
+    if updated.modified_count != 1:
+        fresh = await db.trades.find_one({"trade_id": trade_id}, {"_id": 0, "status": 1})
+        current = (fresh or {}).get("status") or trade["status"]
+        raise HTTPException(status_code=400, detail=f"Can't mark paid — current status: {current}")
     return {"trade_id": trade_id, "status": "paid"}
 
 
