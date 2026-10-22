@@ -129,6 +129,22 @@ def test_orphaned_claim_older_than_hold_is_released():
     assert decision == "active"
 
 
+def test_fresh_claim_is_kept_when_only_an_older_session_expired():
+    """The new checkout has claimed the card but not written a transaction yet."""
+    decision = decide_pending_listing(
+        pending_since=_iso(-timedelta(seconds=5)),
+        transactions=[{
+            "session_id": "cs_old",
+            "payment_status": "unpaid",
+            "created_at": _iso(-timedelta(hours=25)),
+        }],
+        session_states={"cs_old": ("expired", "unpaid")},
+        has_open_trade=False,
+        now=NOW,
+    )
+    assert decision == "pending"
+
+
 def test_fresh_claim_without_a_transaction_is_kept():
     decision = decide_pending_listing(
         pending_since=_iso(-timedelta(seconds=5)),
@@ -355,6 +371,43 @@ async def test_reconcile_releases_claim_that_never_got_a_transaction():
 
     assert changed == ["listing_orphan"]
     assert db.listings.docs[0]["status"] == "active"
+
+
+@pytest.mark.asyncio
+async def test_reconcile_keeps_a_fresh_claim_when_only_an_older_session_expired():
+    db = _DB()
+    _seed_abandoned(db)
+    fresh_since = _iso(-timedelta(seconds=5))
+    db.listings.docs[0]["pending_since"] = fresh_since
+
+    def retrieve(_session_id):
+        return {"status": "expired", "payment_status": "unpaid"}
+
+    changed = await reconcile_abandoned_checkouts(db, retrieve, now=NOW)
+
+    assert changed == []
+    assert db.listings.docs[0]["status"] == "pending"
+    assert db.listings.docs[0]["pending_since"] == fresh_since
+
+
+@pytest.mark.asyncio
+async def test_reconcile_does_not_release_a_claim_taken_during_stripe_lookup():
+    db = _DB()
+    _seed_abandoned(db)
+    fresh_since = _iso(-timedelta(seconds=5))
+
+    def retrieve(_session_id):
+        # Replace the document so the snapshot reconcile already read stays old.
+        current = db.listings.docs[0]
+        db.listings.docs[0] = {**current, "pending_since": fresh_since}
+        return {"status": "expired", "payment_status": "unpaid"}
+
+    changed = await reconcile_abandoned_checkouts(db, retrieve, now=NOW)
+
+    assert changed == []
+    assert db.listings.docs[0]["status"] == "pending"
+    assert db.listings.docs[0]["pending_since"] == fresh_since
+    assert db.payment_transactions.docs[0]["payment_status"] == "pending"
 
 
 @pytest.mark.asyncio
@@ -600,7 +653,11 @@ def test_expired_status_poll_only_reopens_a_pending_listing():
 
     assert resp.status_code == 200
     mock_db.listings.update_one.assert_awaited_once_with(
-        {"listing_id": "listing_sold_later", "status": "pending"},
+        {
+            "listing_id": "listing_sold_later",
+            "status": "pending",
+            "pending_since": {"$lte": "2026-10-01T00:00:00+00:00"},
+        },
         {"$set": {"status": "active"}, "$unset": {"pending_since": ""}},
     )
 

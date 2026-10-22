@@ -118,6 +118,13 @@ def decide_pending_listing(
         return True
 
     if checkout_txns and not any(_holds_listing(t) for t in checkout_txns):
+        # Every stored session is dead. A claim inside the hold window is a
+        # newer checkout or trade that has not written its row yet — the
+        # expired sessions are previous attempts, and releasing now lets a
+        # second buyer pay for the same card.
+        claimed_at = _parse_iso(pending_since)
+        if claimed_at is not None and claimed_at > cutoff:
+            return "pending"
         return "active"
     if checkout_txns:
         return "pending"
@@ -258,8 +265,15 @@ async def reconcile_abandoned_checkouts(db, retrieve_session, now: Optional[date
             continue
 
         if decision == "active":
+            # pending_since was read before the Stripe calls. A buyer can
+            # claim the card during that lookup; only the hold we decided
+            # about may be released.
             result = await db.listings.update_one(
-                {"listing_id": listing_id, "status": "pending"},
+                {
+                    "listing_id": listing_id,
+                    "status": "pending",
+                    "pending_since": listing.get("pending_since"),
+                },
                 {"$set": {"status": "active"}, "$unset": {"pending_since": ""}},
             )
             if getattr(result, "modified_count", 0):

@@ -286,6 +286,23 @@ def test_delete_rejects_a_pending_listing_a_buyer_already_claimed():
     assert listings.docs[0]["status"] == "pending"
 
 
+def test_cancel_does_not_clear_a_checkout_that_claimed_after_the_trade():
+    listings = FakeCollection([_listing()])
+    db = FakeDb(listings, FakeCollection(), _users())
+
+    async def scenario():
+        _use(db, _buyer("buyer_a", "Buyer A"))
+        trade = await _initiate("buyer_a", "Buyer A")
+        listings.docs[0]["pending_since"] = "2099-01-01T00:00:00+00:00"
+        await server.trade_cancel(trade["trade_id"], SimpleNamespace())
+
+    import asyncio
+    asyncio.run(scenario())
+
+    assert listings.docs[0]["status"] == "pending"
+    assert listings.docs[0]["pending_since"] == "2099-01-01T00:00:00+00:00"
+
+
 def test_second_cancel_does_not_clear_a_newer_hold():
     """Canceling an already-canceled trade must not put the card back on sale."""
     listings = FakeCollection([{**_listing(), "status": "pending"}])

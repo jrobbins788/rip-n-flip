@@ -1964,10 +1964,21 @@ async def get_payment_status(session_id: str, request: Request):
                 {"_id": 0, "trade_id": 1},
             )
             if not newer_hold and not open_trade:
-                await db.listings.update_one(
-                    {"listing_id": transaction["listing_id"], "status": "pending"},
-                    {"$set": {"status": "active"}, "$unset": {"pending_since": ""}},
-                )
+                # This session claimed the listing before its transaction row
+                # existed, so pending_since is at or before created_at. A later
+                # checkout or trade stamps a newer pending_since and must keep
+                # the card.
+                release_query = {
+                    "listing_id": transaction["listing_id"],
+                    "status": "pending",
+                }
+                created_at = transaction.get("created_at")
+                if isinstance(created_at, str) and created_at:
+                    release_query["pending_since"] = {"$lte": created_at}
+                    await db.listings.update_one(
+                        release_query,
+                        {"$set": {"status": "active"}, "$unset": {"pending_since": ""}},
+                    )
     
     return {
         "status": status.status,
@@ -2680,9 +2691,16 @@ async def trade_initiate(payload: TradeInitiate, request: Request):
     # Two buyers can both read status=active before either write lands.
     # Only a conditional claim may take the card off the market. pending_claim
     # changes on every attempt, so a second writer cannot look like a no-op.
+    # pending_since is what an expired Stripe checkout compares against, so a
+    # late release of an older session cannot clear this trade.
+    pending_since = datetime.now(timezone.utc).isoformat()
     claim = await db.listings.update_one(
         {"listing_id": payload.listing_id, "status": "active"},
-        {"$set": {"status": "pending", "pending_claim": uuid.uuid4().hex}},
+        {"$set": {
+            "status": "pending",
+            "pending_claim": uuid.uuid4().hex,
+            "pending_since": pending_since,
+        }},
     )
     if claim.modified_count != 1:
         raise HTTPException(status_code=400, detail="Listing not available")
@@ -2714,6 +2732,7 @@ async def trade_initiate(payload: TradeInitiate, request: Request):
         "cashapp_url": cashapp_url,
         "buyer_note": payload.note,
         "status": "awaiting_payment",  # awaiting_payment -> paid -> confirmed -> completed | canceled
+        "pending_since": pending_since,
         "created_at": now_iso,
         "updated_at": now_iso,
     }
@@ -2721,8 +2740,8 @@ async def trade_initiate(payload: TradeInitiate, request: Request):
         await db.trades.insert_one(dict(trade_doc))
     except Exception:
         await db.listings.update_one(
-            {"listing_id": payload.listing_id, "status": "pending"},
-            {"$set": {"status": "active"}, "$unset": {"pending_claim": ""}},
+            {"listing_id": payload.listing_id, "status": "pending", "pending_since": pending_since},
+            {"$set": {"status": "active"}, "$unset": {"pending_claim": "", "pending_since": ""}},
         )
         raise
 
@@ -2809,9 +2828,15 @@ async def trade_cancel(trade_id: str, request: Request):
         {"_id": 0, "trade_id": 1},
     )
     if not other_open:
+        # A checkout that claimed the card after this trade released it writes
+        # a new pending_since. Only the hold this trade took may be cleared.
+        release_query = {"listing_id": trade["listing_id"], "status": "pending"}
+        owned_since = trade.get("pending_since")
+        if isinstance(owned_since, str) and owned_since:
+            release_query["pending_since"] = owned_since
         await db.listings.update_one(
-            {"listing_id": trade["listing_id"], "status": "pending"},
-            {"$set": {"status": "active"}, "$unset": {"pending_claim": ""}},
+            release_query,
+            {"$set": {"status": "active"}, "$unset": {"pending_claim": "", "pending_since": ""}},
         )
     return {"trade_id": trade_id, "status": "canceled"}
 
