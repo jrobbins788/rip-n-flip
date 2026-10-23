@@ -123,6 +123,36 @@ def build_admin_revoke_update(now: datetime) -> dict:
     }
 
 
+_COMP_OR_REWARD_SOURCES = frozenset({"admin_grant", "dub_streak_reward"})
+
+
+def preserve_comp_and_reward_pro(user: dict, fields: dict, now: datetime) -> dict:
+    """Keep a live admin comp or DUB STREAK reward across a Stripe subscription write.
+
+    Those windows live in ``tier`` and ``pro_until``. An active subscription
+    webhook copies Stripe's period end over them, and a canceled webhook sets
+    ``tier`` to free. The next renewal, invoice, or cancellation then ends a
+    longer comp early. Stripe's status and period end are still recorded.
+    A longer Stripe period is allowed to take over, since it already covers
+    the comp.
+    """
+    merged = dict(fields)
+    if (user or {}).get("pro_source") not in _COMP_OR_REWARD_SOURCES:
+        return merged
+    existing_until = parse_iso_datetime((user or {}).get("pro_until"))
+    if existing_until is None or existing_until <= _as_utc(now):
+        return merged
+    incoming_until = parse_iso_datetime(merged.get("pro_until"))
+    if incoming_until is not None and incoming_until >= existing_until:
+        return merged
+    merged["pro_until"] = existing_until.isoformat()
+    if merged.get("tier") == "free":
+        merged["tier"] = "pro"
+    # Leave the stored source in place so a later cancel still sees the comp.
+    merged.pop("pro_source", None)
+    return merged
+
+
 def webhook_regrant_blocked(
     user: dict,
     event_type: Optional[str],
