@@ -17,6 +17,7 @@ from entitlements import (
     admin_display_tier,
     build_admin_grant_update,
     build_admin_revoke_update,
+    preserve_comp_and_reward_pro,
     user_record_is_pro,
     webhook_regrant_blocked,
 )
@@ -361,5 +362,168 @@ def test_forged_deleted_event_cannot_bypass_admin_revoke():
             result = await subscription.stripe_subscription_webhook(Request())
         assert result["ignored"] == "admin_revoke"
         assert updates == []
+
+    asyncio.run(run())
+
+
+def test_stripe_write_keeps_a_longer_admin_grant():
+    now = datetime.now(timezone.utc)
+    grant_end = (now + timedelta(days=90)).isoformat()
+    stripe_end = (now + timedelta(days=10)).isoformat()
+    user = _user(
+        tier="pro",
+        pro_until=grant_end,
+        pro_source="admin_grant",
+        subscription={"status": "active", "current_period_end": grant_end},
+    )
+    merged = preserve_comp_and_reward_pro(user, {
+        "tier": "pro",
+        "pro_until": stripe_end,
+        "pro_source": "stripe_subscription",
+        "subscription.status": "active",
+        "subscription.current_period_end": stripe_end,
+        "subscription.stripe_subscription_id": "sub_live",
+    }, now)
+    assert merged["pro_until"] == grant_end
+    assert merged["tier"] == "pro"
+    assert "pro_source" not in merged
+    assert merged["subscription.current_period_end"] == stripe_end
+    assert merged["subscription.status"] == "active"
+    kept = _apply(user, {"$set": merged})
+    assert user_record_is_pro(kept, now + timedelta(days=80)) is True
+
+
+def test_canceled_stripe_write_keeps_a_live_dub_streak_reward():
+    now = datetime.now(timezone.utc)
+    reward_end = (now + timedelta(days=12)).isoformat()
+    user = _user(
+        tier="pro",
+        pro_until=reward_end,
+        pro_source="dub_streak_reward",
+        subscription={"status": "active", "stripe_subscription_id": "sub_live"},
+    )
+    merged = preserve_comp_and_reward_pro(user, {
+        "tier": "free",
+        "subscription.status": "canceled",
+        "subscription.stripe_subscription_id": "sub_live",
+        "subscription.current_period_end": (now - timedelta(hours=1)).isoformat(),
+    }, now)
+    assert merged["tier"] == "pro"
+    assert merged["pro_until"] == reward_end
+    assert merged["subscription.status"] == "canceled"
+    kept = _apply(user, {"$set": merged})
+    assert user_record_is_pro(kept, now + timedelta(days=11)) is True
+    assert user_record_is_pro(kept, now + timedelta(days=13)) is False
+
+
+def test_stripe_cancel_still_ends_stripe_sourced_pro():
+    now = datetime.now(timezone.utc)
+    user = _user(
+        tier="pro",
+        pro_until=(now + timedelta(days=10)).isoformat(),
+        pro_source="stripe_subscription",
+        subscription={"status": "active"},
+    )
+    merged = preserve_comp_and_reward_pro(user, {
+        "tier": "free",
+        "subscription.status": "canceled",
+    }, now)
+    assert merged == {"tier": "free", "subscription.status": "canceled"}
+    assert user_record_is_pro(_apply(user, {"$set": merged}), now) is False
+
+
+def test_expired_reward_does_not_block_a_stripe_cancel():
+    now = datetime.now(timezone.utc)
+    user = _user(
+        tier="pro",
+        pro_until=(now - timedelta(days=1)).isoformat(),
+        pro_source="dub_streak_reward",
+    )
+    merged = preserve_comp_and_reward_pro(user, {
+        "tier": "free",
+        "subscription.status": "canceled",
+    }, now)
+    assert merged["tier"] == "free"
+
+
+def test_longer_stripe_period_replaces_a_shorter_reward():
+    now = datetime.now(timezone.utc)
+    stripe_end = (now + timedelta(days=30)).isoformat()
+    user = _user(
+        tier="pro",
+        pro_until=(now + timedelta(days=5)).isoformat(),
+        pro_source="dub_streak_reward",
+    )
+    merged = preserve_comp_and_reward_pro(user, {
+        "tier": "pro",
+        "pro_until": stripe_end,
+        "pro_source": "stripe_subscription",
+        "subscription.status": "active",
+    }, now)
+    assert merged["pro_until"] == stripe_end
+    assert merged["pro_source"] == "stripe_subscription"
+
+
+def test_active_webhook_does_not_shorten_an_admin_grant():
+    import routes.subscription as subscription
+
+    now = datetime.now(timezone.utc)
+    grant_end = (now + timedelta(days=90)).isoformat()
+    user = _user(
+        tier="pro",
+        pro_until=grant_end,
+        pro_source="admin_grant",
+        subscription={
+            "status": "active",
+            "stripe_customer_id": "cus_1",
+            "stripe_subscription_id": "sub_live",
+            "current_period_end": grant_end,
+        },
+    )
+    updates = []
+
+    class Users:
+        async def find_one(self, *args, **kwargs):
+            return user
+
+        async def update_one(self, *args, **kwargs):
+            updates.append(args)
+
+    class DB:
+        users = Users()
+
+    body = json.dumps({
+        "type": "customer.subscription.updated",
+        "data": {"object": {"id": "sub_live", "customer": "cus_1", "status": "active"}},
+    }).encode()
+
+    class Request:
+        headers = {}
+
+        async def body(self):
+            return body
+
+    stripe_end = int((now + timedelta(days=10)).timestamp())
+    retrieved = {
+        "id": "sub_live",
+        "customer": "cus_1",
+        "status": "active",
+        "current_period_end": stripe_end,
+        "cancel_at_period_end": False,
+    }
+
+    async def run():
+        with patch.object(subscription, "db", DB()), patch.object(
+            subscription.stripe_sdk.Subscription, "retrieve", return_value=retrieved
+        ):
+            result = await subscription.stripe_subscription_webhook(Request())
+        assert result["applied"] is True
+        written = updates[0][1]["$set"]
+        assert written["pro_until"] == grant_end
+        assert written["tier"] == "pro"
+        assert "pro_source" not in written
+        assert written["subscription.status"] == "active"
+        kept = _apply(user, updates[0][1])
+        assert user_record_is_pro(kept, now + timedelta(days=80)) is True
 
     asyncio.run(run())
