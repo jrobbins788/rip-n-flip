@@ -348,7 +348,18 @@ async def logout(request: Request, response: Response):
     token = request.cookies.get("session_token")
     if token:
         await db.user_sessions.delete_many({"session_token": token})
-    response.delete_cookie(key="session_token", path="/")
+    # Login sets this cookie Secure + SameSite=None so the browser will store
+    # it on a cross-site response (the site and the API are different origins).
+    # delete_cookie() defaults to SameSite=Lax and Secure omitted. Browsers
+    # drop that header on a cross-site logout, and a password JWT is not
+    # stored server-side, so the old cookie keeps the user signed in.
+    response.delete_cookie(
+        key="session_token",
+        path="/",
+        httponly=True,
+        secure=True,
+        samesite="none",
+    )
     # Older admin logins set this unused cookie name. Clear it so logout is complete.
     response.delete_cookie(key="auth_token", path="/")
     return {"message": "Logged out"}
