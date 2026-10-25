@@ -43,6 +43,14 @@ from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 logger = logging.getLogger("ripnflip.cors")
 
+# Cookie session is SameSite=None so the site on another host can call the API.
+# A cross-site form POST is a "simple" request: the browser sends the cookie and
+# does not preflight. Routes with no JSON body (Cash App confirm / cancel /
+# mark-paid, subscription cancel, admin grant and revoke) still run.
+# Browsers attach Origin on those posts. Stripe webhooks and non-browser
+# clients omit it and must keep working.
+_UNSAFE_METHODS = frozenset({"POST", "PUT", "PATCH", "DELETE"})
+
 # Always echoed for credentialed browser calls. Do not drop these when
 # CORS_ORIGINS is missing or still set to the old wildcard.
 PRODUCTION_ORIGINS: tuple[str, ...] = (
@@ -109,6 +117,43 @@ def resolve_allowed_origins(raw: str | None = None) -> list[str]:
     return allowed
 
 
+def _origin_header(scope: Scope) -> str | None:
+    for key, value in scope.get("headers") or []:
+        if key.lower() == b"origin":
+            try:
+                return value.decode("latin-1").strip()
+            except UnicodeError:
+                return ""
+    return None
+
+
+class CrossSiteWriteGuard:
+    """Reject unsafe requests whose Origin is not the site that owns the cookie.
+
+    Missing Origin is allowed. A browser form POST always sends one, including
+    the literal ``null`` origin from a sandboxed frame.
+    """
+
+    def __init__(self, app: ASGIApp, allowed_origins: Sequence[str]) -> None:
+        self.app = app
+        self.allowed_origins = set(allowed_origins)
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] != "http" or scope.get("method") not in _UNSAFE_METHODS:
+            await self.app(scope, receive, send)
+            return
+        origin = _origin_header(scope)
+        if origin is not None and origin not in self.allowed_origins:
+            logger.info("Blocked cross-site %s from origin %r", scope.get("method"), origin)
+            response = JSONResponse(
+                status_code=403,
+                content={"detail": "Cross-site request blocked"},
+            )
+            await response(scope, receive, send)
+            return
+        await self.app(scope, receive, send)
+
+
 class UnhandledServerErrorMiddleware:
     """Turn unhandled errors into responses while still inside CORSMiddleware.
 
@@ -164,7 +209,10 @@ def install_cors(app: Any, *, allowed_origins: list[str] | None = None) -> list[
         )
 
     # add_middleware inserts at the front, so the last call is outermost.
+    # Guard sits inside CORS so a rejected browser call still gets ACAO when
+    # the origin is allowed, and outside the app so the route never runs.
     app.add_middleware(UnhandledServerErrorMiddleware)
+    app.add_middleware(CrossSiteWriteGuard, allowed_origins=origins)
     app.add_middleware(
         CORSMiddleware,
         allow_credentials=True,
