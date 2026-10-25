@@ -141,6 +141,52 @@ def test_actual_post_after_preflight_echoes_origin():
     assert response.headers["access-control-allow-credentials"] == "true"
 
 
+def test_cross_site_form_post_does_not_run_the_handler():
+    """SameSite=None cookies ride along on a foreign form POST.
+
+    Cash App confirm, cancel, and mark-paid have no JSON body, so the browser
+    does not preflight and the write used to land. Origin is always present on
+    that post; Stripe webhooks omit it.
+    """
+    calls = {"n": 0}
+    app = FastAPI()
+
+    @app.post("/api/trades/{trade_id}/confirm")
+    def confirm(trade_id: str):
+        calls["n"] += 1
+        return {"trade_id": trade_id, "status": "completed"}
+
+    install_cors(app, allowed_origins=resolve_allowed_origins(""))
+    client = TestClient(app)
+
+    blocked = client.post(
+        "/api/trades/trade_victim/confirm",
+        headers={"Origin": EVIL, "Cookie": "session_token=seller"},
+    )
+    assert blocked.status_code == 403
+    assert blocked.json()["detail"] == "Cross-site request blocked"
+    assert calls["n"] == 0
+
+    sandboxed = client.post(
+        "/api/trades/trade_victim/confirm",
+        headers={"Origin": "null", "Cookie": "session_token=seller"},
+    )
+    assert sandboxed.status_code == 403
+    assert calls["n"] == 0
+
+    allowed = client.post(
+        "/api/trades/trade_victim/confirm",
+        headers={"Origin": WWW, "Cookie": "session_token=seller"},
+    )
+    assert allowed.status_code == 200
+    assert allowed.json()["status"] == "completed"
+    assert calls["n"] == 1
+
+    webhook = client.post("/api/trades/trade_victim/confirm")
+    assert webhook.status_code == 200
+    assert calls["n"] == 2
+
+
 def test_unhandled_500_still_carries_cors_headers():
     response = _client().get("/api/packs/price", headers={"Origin": WWW})
     assert response.status_code == 500
