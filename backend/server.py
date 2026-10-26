@@ -136,7 +136,52 @@ def hash_password(password: str) -> str:
     return bcrypt.hashpw(password.encode('utf-8'), bcrypt.gensalt()).decode('utf-8')
 
 def verify_password(password: str, hashed: str) -> bool:
-    return bcrypt.checkpw(password.encode('utf-8'), hashed.encode('utf-8'))
+    # OAuth accounts have no password hash. bcrypt raises on an empty or
+    # malformed hash, which turned a password login into a 500.
+    if not isinstance(hashed, str) or not hashed:
+        return False
+    try:
+        return bcrypt.checkpw(password.encode('utf-8'), hashed.encode('utf-8'))
+    except (ValueError, TypeError):
+        return False
+
+
+def _canonical_email(email: str) -> str:
+    return email.strip().lower()
+
+
+async def _users_with_email(email: str) -> list:
+    """Every account whose address matches, ignoring case and surrounding space.
+
+    Gmail and Google treat the local part as case-insensitive. An exact
+    `find_one` split one person into a password account and an empty Google
+    account, and the binder, listings, and Pro grant stayed on the first.
+    """
+    stripped = email.strip()
+    canonical = stripped.lower()
+    if not canonical or len(canonical) > 320:
+        return []
+    found = []
+    seen = set()
+
+    def _add(doc):
+        if not isinstance(doc, dict):
+            return
+        uid = doc.get("user_id")
+        if not uid or uid in seen:
+            return
+        seen.add(uid)
+        found.append(doc)
+
+    exact = await db.users.find_one({"email": stripped}, {"_id": 0})
+    _add(exact)
+    cursor = db.users.find(
+        {"email": {"$regex": f"^{re.escape(canonical)}$", "$options": "i"}},
+        {"_id": 0},
+    )
+    for doc in await cursor.to_list(5):
+        _add(doc)
+    return found
 
 def create_jwt_token(user_id: str) -> str:
     payload = {
@@ -193,8 +238,8 @@ async def require_auth(request: Request) -> dict:
 
 @api_router.post("/auth/register")
 async def register(user_data: UserCreate, response: Response):
-    existing = await db.users.find_one({"email": user_data.email}, {"_id": 0})
-    if existing:
+    email = _canonical_email(user_data.email)
+    if await _users_with_email(email):
         raise HTTPException(status_code=400, detail="Email already registered")
     
     user_id = f"user_{uuid.uuid4().hex[:12]}"
@@ -202,7 +247,7 @@ async def register(user_data: UserCreate, response: Response):
     
     user_doc = {
         "user_id": user_id,
-        "email": user_data.email,
+        "email": email,
         "name": user_data.name,
         "password_hash": hashed_pw,
         "picture": None,
@@ -225,16 +270,26 @@ async def register(user_data: UserCreate, response: Response):
     
     return {
         "user_id": user_id,
-        "email": user_data.email,
+        "email": email,
         "name": user_data.name,
         "token": token
     }
 
 @api_router.post("/auth/login")
 async def login(credentials: UserLogin, response: Response):
-    user = await db.users.find_one({"email": credentials.email}, {"_id": 0})
-    if not user or not verify_password(credentials.password, user.get("password_hash", "")):
+    typed = credentials.email.strip()
+    matches = await _users_with_email(typed)
+    exact = [u for u in matches if u.get("email") == typed]
+    # One address can already exist twice when only the case differs. Sign in
+    # to the single account the password opens, and do not guess when two do.
+    candidates = exact or matches
+    verified = [
+        u for u in candidates
+        if verify_password(credentials.password, u.get("password_hash", ""))
+    ]
+    if len(verified) != 1:
         raise HTTPException(status_code=401, detail="Invalid credentials")
+    user = verified[0]
     
     token = create_jwt_token(user["user_id"])
     response.set_cookie(
@@ -280,29 +335,56 @@ async def process_session(request: Request, response: Response):
     name = oauth_data.get("name")
     picture = oauth_data.get("picture")
     session_token = oauth_data.get("session_token")
-    
-    # Check if user exists
-    existing_user = await db.users.find_one({"email": email}, {"_id": 0})
-    
-    if existing_user:
-        user_id = existing_user["user_id"]
-        # Update user info
+    # A missing address must not query email=null, which matches every user
+    # document that has no email field and would sign them all into one account.
+    if not isinstance(email, str) or not email.strip():
+        raise HTTPException(status_code=401, detail="Invalid session")
+    if not isinstance(session_token, str) or not session_token.strip():
+        raise HTTPException(status_code=401, detail="Invalid session")
+    email = email.strip()
+    session_token = session_token.strip()
+    canonical = _canonical_email(email)
+
+    # Check if user exists. Case-only differences are the same address.
+    matches = await _users_with_email(email)
+    exact = next((u for u in matches if u.get("email") == email), None)
+
+    if exact is not None:
+        user_id = exact["user_id"]
+        # Update user info. Exact-match linking is unchanged.
         await db.users.update_one(
             {"user_id": user_id},
             {"$set": {"name": name, "picture": picture}}
+        )
+    elif len(matches) == 1 and not matches[0].get("password_hash"):
+        # Same Google user, address stored with different capitalization.
+        user_id = matches[0]["user_id"]
+        email = canonical
+        await db.users.update_one(
+            {"user_id": user_id},
+            {"$set": {"name": name, "picture": picture, "email": canonical}}
+        )
+    elif matches:
+        # Do not open a second empty account, and do not attach Google to a
+        # password account that was registered under a different spelling.
+        # The password login still reaches the binder, listings, and Pro grant.
+        raise HTTPException(
+            status_code=409,
+            detail="An account with this email already exists. Log in with your password.",
         )
     else:
         # Create new user
         user_id = f"user_{uuid.uuid4().hex[:12]}"
         user_doc = {
             "user_id": user_id,
-            "email": email,
+            "email": canonical,
             "name": name,
             "picture": picture,
             "cash_app_tag": None,
             "created_at": datetime.now(timezone.utc).isoformat()
         }
         await db.users.insert_one(user_doc)
+        email = canonical
     
     # Store session
     session_doc = {
