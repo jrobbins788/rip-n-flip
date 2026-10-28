@@ -678,7 +678,7 @@ class TestAuthRegression:
         )
         assert response.status_code == 200
         data = response.json()
-        assert data["cash_app_tag"] == "$TestProfileTag"
+        assert data["cash_app_tag"] == "TestProfileTag"
         print(f"✓ Profile update with cash_app_tag working")
 
 

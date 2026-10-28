@@ -138,6 +138,28 @@ def hash_password(password: str) -> str:
 def verify_password(password: str, hashed: str) -> bool:
     return bcrypt.checkpw(password.encode('utf-8'), hashed.encode('utf-8'))
 
+
+# Cash App payment links are https://cash.app/$cashtag/<amount>. The amount is
+# the next path segment, so a saved tag of "seller/1.00" opens a $1 payment
+# for a card whose price was hundreds of dollars. Cashtags are 1–20 characters,
+# alphanumeric (underscores allowed), and must contain a letter.
+_CASH_APP_TAG = re.compile(r"^(?=.*[A-Za-z])[A-Za-z0-9_]{1,20}$")
+
+
+def canonical_cash_app_tag(raw: Optional[str]) -> str:
+    """Return a tag safe to place in a Cash App payment URL. Empty clears it."""
+    tag = (raw or "").strip()
+    if tag.startswith("$"):
+        tag = tag[1:].strip()
+    if not tag:
+        return ""
+    if _CASH_APP_TAG.fullmatch(tag) is None:
+        raise HTTPException(
+            status_code=400,
+            detail="Cash App tag must be 1-20 letters, numbers, or underscores and include a letter.",
+        )
+    return tag
+
 def create_jwt_token(user_id: str) -> str:
     payload = {
         "user_id": user_id,
@@ -357,6 +379,8 @@ async def logout(request: Request, response: Response):
 async def update_profile(update_data: UserUpdate, request: Request):
     user = await require_auth(request)
     update_dict = {k: v for k, v in update_data.model_dump().items() if v is not None}
+    if "cash_app_tag" in update_dict:
+        update_dict["cash_app_tag"] = canonical_cash_app_tag(update_dict["cash_app_tag"])
     if update_dict:
         await db.users.update_one({"user_id": user["user_id"]}, {"$set": update_dict})
     updated_user = await db.users.find_one({"user_id": user["user_id"]}, {"_id": 0, "password_hash": 0})
@@ -2673,7 +2697,13 @@ async def trade_initiate(payload: TradeInitiate, request: Request):
     seller = await db.users.find_one({"user_id": listing["user_id"]}, {"_id": 0})
     if not seller:
         raise HTTPException(status_code=404, detail="Seller not found")
-    seller_tag = (seller.get("cash_app_tag") or "").strip().lstrip("$")
+    try:
+        seller_tag = canonical_cash_app_tag(seller.get("cash_app_tag"))
+    except HTTPException:
+        raise HTTPException(
+            status_code=400,
+            detail="Seller's Cash App tag isn't valid, so a payment link can't be opened.",
+        )
     if not seller_tag:
         raise HTTPException(status_code=400, detail="Seller hasn't set a Cash App tag yet")
 
