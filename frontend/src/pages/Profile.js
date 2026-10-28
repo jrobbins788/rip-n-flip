@@ -103,7 +103,7 @@ export default function Profile() {
       toast.success('Cash App tag updated');
       setEditingCashApp(false);
     } catch (error) {
-      toast.error('Failed to update Cash App tag');
+      toast.error(error.message || 'Failed to update Cash App tag');
     }
   };
 

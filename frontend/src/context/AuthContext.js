@@ -109,7 +109,9 @@ export function AuthProvider({ children }) {
     });
     
     if (!response.ok) {
-      throw new Error('Profile update failed');
+      const error = await response.json().catch(() => ({}));
+      const detail = error.detail;
+      throw new Error(typeof detail === 'string' ? detail : 'Profile update failed');
     }
     
     const updatedUser = await response.json();

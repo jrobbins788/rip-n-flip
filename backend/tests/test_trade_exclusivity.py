@@ -131,6 +131,57 @@ async def _initiate(user_id, name):
     )
 
 
+def test_cash_app_tag_with_a_slash_cannot_rewrite_the_payment_amount():
+    """The payment URL is https://cash.app/$tag/<amount>.
+
+    A tag of seller/1.00 would open Cash App at $1 for a $100 card, and the
+    seller could then confirm that payment and take the card off the market.
+    """
+    listings = FakeCollection([_listing()])
+    trades = FakeCollection()
+    users = FakeCollection([
+        {"user_id": "seller_1", "name": "Seller", "cash_app_tag": "seller/1.00"},
+    ])
+    db = FakeDb(listings, trades, users)
+
+    async def scenario():
+        _use(db, _buyer("buyer_a", "Buyer A"))
+        with pytest.raises(HTTPException) as raised:
+            await _initiate("buyer_a", "Buyer A")
+        return raised.value
+
+    import asyncio
+    error = asyncio.run(scenario())
+    assert error.status_code == 400
+    assert listings.docs[0]["status"] == "active"
+    assert trades.docs == []
+
+
+def test_profile_rejects_a_cash_app_tag_that_changes_the_payment_url():
+    users = FakeCollection([{"user_id": "seller_1", "name": "Seller", "cash_app_tag": "seller"}])
+    db = FakeDb(FakeCollection(), FakeCollection(), users)
+
+    async def scenario():
+        _use(db, _buyer("seller_1", "Seller"))
+        with pytest.raises(HTTPException) as raised:
+            await server.update_profile(
+                server.UserUpdate(cash_app_tag="seller/1.00"),
+                SimpleNamespace(),
+            )
+        saved = server.canonical_cash_app_tag("$Good_Tag1")
+        await server.update_profile(
+            server.UserUpdate(cash_app_tag="$Good_Tag1"),
+            SimpleNamespace(),
+        )
+        return raised.value, saved, users.docs[0]["cash_app_tag"]
+
+    import asyncio
+    error, saved, stored = asyncio.run(scenario())
+    assert error.status_code == 400
+    assert saved == "Good_Tag1"
+    assert stored == "Good_Tag1"
+
+
 def test_second_buyer_loses_the_race_and_does_not_get_a_trade():
     """Both buyers still observe active. Only the conditional claim may win."""
     listings = FakeCollection([_listing()], stale_reads_after_write=True)
