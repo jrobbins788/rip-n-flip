@@ -54,6 +54,22 @@ def _period_end_unix(data: dict) -> Optional[int]:
     return max(ends) if ends else None
 
 
+def metadata_user_id(sub: Any) -> Optional[str]:
+    """User id this app stored on the Stripe subscription, if it is one of ours.
+
+    Checkout copies ``metadata.user_id`` onto the subscription. The webhook
+    must read it from Subscription.retrieve, never from the event body.
+    """
+    data = _as_mapping(sub) or {}
+    meta = data.get("metadata")
+    if not isinstance(meta, dict):
+        return None
+    user_id = meta.get("user_id")
+    if isinstance(user_id, str) and user_id.startswith("user_"):
+        return user_id
+    return None
+
+
 def subscription_write_from_stripe(sub: Any) -> Optional[dict]:
     """Return ``{"customer_id", "set"}`` or None when nothing may be written.
 
