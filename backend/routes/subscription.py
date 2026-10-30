@@ -20,6 +20,8 @@ from __future__ import annotations
 import json
 import os
 import logging
+import time
+import uuid
 from datetime import datetime, timezone
 from typing import Optional
 
@@ -37,7 +39,7 @@ from core import (
     STRIPE_API_KEY,
     PRO_PRICE_AMOUNT_USD,
 )
-from subscription_sync import subscription_write_from_stripe
+from subscription_sync import metadata_user_id, subscription_write_from_stripe
 
 router = APIRouter(prefix="/api", tags=["subscription"])
 
@@ -94,6 +96,175 @@ class SubscriptionCheckoutRequest(BaseModel):
     origin_url: str
 
 
+# A second Checkout Session while one of these is on file bills the customer again.
+_OPEN_SUBSCRIPTION_STATUSES = frozenset({"active", "trialing", "past_due"})
+# A finished subscription may start a new Checkout. Anything else, including a
+# payment that has not been written locally yet, must not open another one.
+_FINISHED_SUBSCRIPTION_STATUSES = frozenset({
+    "canceled", "unpaid", "incomplete_expired",
+})
+# A request that dies after claiming the slot must not block upgrades forever.
+_CHECKOUT_CLAIM_TTL_SECONDS = 120
+
+
+def subscription_blocks_new_checkout(user: dict) -> bool:
+    """True when this user already has a Stripe subscription that is still billing."""
+    sub = (user or {}).get("subscription") or {}
+    sub_id = sub.get("stripe_subscription_id")
+    if not isinstance(sub_id, str) or not sub_id.startswith("sub_"):
+        return False
+    return sub.get("status") in _OPEN_SUBSCRIPTION_STATUSES
+
+
+def checkout_claim_is_in_flight(token, now: Optional[float] = None) -> bool:
+    """True when ``token`` is a checkout claim another request still holds.
+
+    Tokens are ``creating_{unix_seconds}_{uuid}``. A claim with no timestamp,
+    or one older than the TTL, can be replaced.
+    """
+    if not isinstance(token, str) or not token.startswith("creating_"):
+        return False
+    parts = token.split("_")
+    if len(parts) < 3:
+        return False
+    try:
+        started = int(parts[1])
+    except ValueError:
+        return False
+    current = time.time() if now is None else now
+    return current - started < _CHECKOUT_CLAIM_TTL_SECONDS
+
+
+def _stripe_field(obj, name):
+    if isinstance(obj, dict):
+        return obj.get(name)
+    getter = getattr(obj, "get", None)
+    if callable(getter):
+        value = getter(name)
+        if value is not None:
+            return value
+    return getattr(obj, name, None)
+
+
+async def _retrieve_checkout_session(session_id: str):
+    """Load a Checkout Session, or None when Stripe no longer has it."""
+    if not isinstance(session_id, str) or not session_id.startswith("cs_"):
+        return None
+    try:
+        return stripe_sdk.checkout.Session.retrieve(session_id)
+    except Exception as exc:
+        logger.warning(f"Could not reuse subscription checkout {session_id}: {exc}")
+        return None
+
+
+def _open_checkout_payload(session) -> Optional[dict]:
+    if _stripe_field(session, "status") != "open":
+        return None
+    url = _stripe_field(session, "url")
+    sid = _stripe_field(session, "id")
+    if not url or not sid:
+        return None
+    return {"url": url, "session_id": sid}
+
+
+async def _claim_checkout_slot(user_id: str, replace_token: Optional[str]) -> str:
+    """One in-flight Checkout per user. The loser must reuse the winner's session."""
+    token = f"creating_{int(time.time())}_{uuid.uuid4().hex}"
+    allowed = [None, ""]
+    if isinstance(replace_token, str) and (
+        replace_token.startswith("cs_") or replace_token.startswith("creating_")
+    ):
+        if checkout_claim_is_in_flight(replace_token):
+            raise HTTPException(
+                status_code=409,
+                detail="A Pro checkout is already in progress. Finish that window or wait a moment and try again.",
+            )
+        allowed.append(replace_token)
+    claim = await db.users.update_one(
+        {
+            "user_id": user_id,
+            "$or": [
+                {"subscription.pending_checkout_session_id": {"$exists": False}},
+                {"subscription.pending_checkout_session_id": {"$in": allowed}},
+            ],
+        },
+        {"$set": {"subscription.pending_checkout_session_id": token}},
+    )
+    if getattr(claim, "modified_count", 0) == 1:
+        return token
+    raise HTTPException(
+        status_code=409,
+        detail="A Pro checkout is already in progress. Finish that window or wait a moment and try again.",
+    )
+
+
+async def _clear_checkout_slot(user_id: str, token: str) -> None:
+    await db.users.update_one(
+        {"user_id": user_id, "subscription.pending_checkout_session_id": token},
+        {"$unset": {"subscription.pending_checkout_session_id": ""}},
+    )
+
+
+async def _customer_id_for_checkout(user: dict) -> str:
+    """Return the Stripe customer this checkout must bill.
+
+    Two upgrade clicks used to each create a customer and the later write
+    replaced ``stripe_customer_id``. Paying the first Checkout then stored
+    the unpaid customer, so the renewal webhook never found the payer.
+
+    A customer already stored on a different account is not reused. Stripe's
+    email search is case-insensitive, and a second account for the same inbox
+    would otherwise be billed on the first account's customer.
+    """
+    user_id = user["user_id"]
+    existing_id = (user.get("subscription") or {}).get("stripe_customer_id")
+    if isinstance(existing_id, str) and existing_id.startswith("cus_"):
+        return existing_id
+
+    customer_id = None
+    listed = stripe_sdk.Customer.list(email=user["email"], limit=1)
+    listed_id = listed.data[0].id if getattr(listed, "data", None) else None
+    if isinstance(listed_id, str) and listed_id.startswith("cus_"):
+        other = await db.users.find_one(
+            {
+                "subscription.stripe_customer_id": listed_id,
+                "user_id": {"$ne": user_id},
+            },
+            {"_id": 0, "user_id": 1},
+        )
+        if not other:
+            customer_id = listed_id
+    if not customer_id:
+        created = stripe_sdk.Customer.create(
+            email=user["email"],
+            name=user.get("name") or user["email"],
+        )
+        customer_id = created.id
+
+    claim = await db.users.update_one(
+        {
+            "user_id": user_id,
+            "$or": [
+                {"subscription.stripe_customer_id": {"$exists": False}},
+                {"subscription.stripe_customer_id": None},
+                {"subscription.stripe_customer_id": ""},
+            ],
+        },
+        {"$set": {"subscription.stripe_customer_id": customer_id}},
+    )
+    if getattr(claim, "modified_count", 0) == 1:
+        return customer_id
+
+    current = await db.users.find_one(
+        {"user_id": user_id},
+        {"_id": 0, "subscription.stripe_customer_id": 1},
+    )
+    stored = ((current or {}).get("subscription") or {}).get("stripe_customer_id")
+    if isinstance(stored, str) and stored.startswith("cus_"):
+        return stored
+    return customer_id
+
+
 @router.post("/subscription/checkout")
 async def subscription_checkout(payload: SubscriptionCheckoutRequest, request: Request):
     """Create a Stripe Checkout Session in subscription mode for $3.99/mo Pro."""
@@ -103,6 +274,36 @@ async def subscription_checkout(payload: SubscriptionCheckoutRequest, request: R
             status_code=503,
             detail="Subscriptions need a real Stripe test key. Get one at https://dashboard.stripe.com/test/apikeys and replace STRIPE_API_KEY in backend/.env, then restart backend.",
         )
+    fresh = await db.users.find_one({"user_id": user["user_id"]}, {"_id": 0})
+    if not fresh:
+        raise HTTPException(status_code=401, detail="Not authenticated")
+    if subscription_blocks_new_checkout(fresh):
+        raise HTTPException(
+            status_code=409,
+            detail="You already have a Pro subscription. It keeps billing until you cancel it.",
+        )
+    user = fresh
+    pending_id = (user.get("subscription") or {}).get("pending_checkout_session_id")
+    if checkout_claim_is_in_flight(pending_id):
+        raise HTTPException(
+            status_code=409,
+            detail="A Pro checkout is already in progress. Finish that window or wait a moment and try again.",
+        )
+    if isinstance(pending_id, str) and pending_id.startswith("cs_"):
+        existing_session = await _retrieve_checkout_session(pending_id)
+        reused = _open_checkout_payload(existing_session)
+        if reused:
+            return reused
+        # Paid sessions stay complete for a while before the webhook writes
+        # status. Opening another one here bills a second subscription.
+        if existing_session is not None and _stripe_field(existing_session, "status") == "complete":
+            local_status = (user.get("subscription") or {}).get("status")
+            if local_status not in _FINISHED_SUBSCRIPTION_STATUSES:
+                raise HTTPException(
+                    status_code=409,
+                    detail="Your Pro payment is processing. Refresh in a moment.",
+                )
+
     try:
         price_id = await _get_or_create_pro_price()
     except Exception as e:
@@ -112,20 +313,10 @@ async def subscription_checkout(payload: SubscriptionCheckoutRequest, request: R
     origin = payload.origin_url.rstrip('/')
     success_url = f"{origin}/vault?subscription=success&session_id={{CHECKOUT_SESSION_ID}}"
     cancel_url = f"{origin}/vault?subscription=canceled"
+    token = await _claim_checkout_slot(user["user_id"], pending_id if isinstance(pending_id, str) else None)
 
     try:
-        customer_id = (user.get("subscription") or {}).get("stripe_customer_id")
-        if not customer_id:
-            existing = stripe_sdk.Customer.list(email=user["email"], limit=1)
-            if existing.data:
-                customer_id = existing.data[0].id
-            else:
-                customer = stripe_sdk.Customer.create(email=user["email"], name=user.get("name"))
-                customer_id = customer.id
-            await db.users.update_one(
-                {"user_id": user["user_id"]},
-                {"$set": {"subscription.stripe_customer_id": customer_id}},
-            )
+        customer_id = await _customer_id_for_checkout(user)
 
         session = stripe_sdk.checkout.Session.create(
             mode="subscription",
@@ -134,8 +325,31 @@ async def subscription_checkout(payload: SubscriptionCheckoutRequest, request: R
             success_url=success_url,
             cancel_url=cancel_url,
             metadata={"user_id": user["user_id"], "plan": "pro_monthly"},
+            subscription_data={
+                "metadata": {"user_id": user["user_id"], "plan": "pro_monthly"},
+            },
         )
 
+        saved = await db.users.update_one(
+            {"user_id": user["user_id"], "subscription.pending_checkout_session_id": token},
+            {"$set": {"subscription.pending_checkout_session_id": session.id}},
+        )
+        # matched_count stays 1 when the write lands. modified_count can be 0
+        # when the stored value was already that session id.
+        saved_count = getattr(saved, "matched_count", None)
+        if saved_count is None:
+            saved_count = getattr(saved, "modified_count", 0)
+        if saved_count != 1:
+            # Another request took the slot and may already have a session.
+            # Expire this one so the customer cannot pay both.
+            try:
+                stripe_sdk.checkout.Session.expire(session.id)
+            except Exception as exc:
+                logger.warning(f"Could not expire extra subscription checkout {session.id}: {exc}")
+            raise HTTPException(
+                status_code=409,
+                detail="A Pro checkout is already in progress. Finish that window or wait a moment and try again.",
+            )
         await db.payment_transactions.insert_one({
             "session_id": session.id,
             "user_id": user["user_id"],
@@ -149,8 +363,15 @@ async def subscription_checkout(payload: SubscriptionCheckoutRequest, request: R
 
         return {"url": session.url, "session_id": session.id}
     except stripe_sdk.error.StripeError as e:
+        await _clear_checkout_slot(user["user_id"], token)
         logger.error(f"Stripe subscription checkout error: {e}")
         raise HTTPException(status_code=502, detail=f"Stripe error: {str(e)}")
+    except HTTPException:
+        await _clear_checkout_slot(user["user_id"], token)
+        raise
+    except Exception:
+        await _clear_checkout_slot(user["user_id"], token)
+        raise
 
 
 @router.get("/subscription/status")
@@ -302,10 +523,21 @@ async def stripe_subscription_webhook(request: Request):
     user = await db.users.find_one(
         {"subscription.stripe_customer_id": customer_id}, {"_id": 0}
     )
+    # The paid customer id can be missing on the user when a second upgrade
+    # click overwrote it before this subscription was paid. The id on the
+    # retrieved subscription was set by our checkout, not by the event body.
+    linked_by_metadata = False
+    if not user:
+        payer_id = metadata_user_id(retrieved)
+        if payer_id:
+            user = await db.users.find_one({"user_id": payer_id}, {"_id": 0})
+            linked_by_metadata = user is not None
     if not user:
         return {"received": True, "verified": verified, "applied": False}
 
     sub_set = dict(decision["set"])
+    if linked_by_metadata:
+        sub_set["subscription.stripe_customer_id"] = customer_id
     retrieved_status = sub_set.get("subscription.status")
     retrieved_sub_id = sub_set.get("subscription.stripe_subscription_id")
     # The event type in the body is not a source of truth. A forged

@@ -229,6 +229,77 @@ def test_forged_invoice_does_not_mark_payment_paid():
     mock_db.users.update_one.assert_not_called()
 
 
+def test_paid_customer_is_linked_from_subscription_metadata_when_the_stored_id_differs():
+    """Two upgrade clicks can leave the user pointing at the unpaid customer.
+
+    The subscription Stripe actually billed carries the user id our checkout
+    wrote. That payer still receives Pro, and the paid customer id is saved.
+    """
+    mock_db = _mock_db()
+
+    async def find_one(query, projection=None):
+        if query.get("subscription.stripe_customer_id") == "cus_paid":
+            return None
+        if query.get("user_id") == "user_payer":
+            return {
+                "user_id": "user_payer",
+                "subscription": {"stripe_customer_id": "cus_unpaid"},
+            }
+        raise AssertionError(f"unexpected lookup {query}")
+
+    mock_db.users.find_one = AsyncMock(side_effect=find_one)
+    retrieved = {
+        "id": "sub_paid",
+        "customer": "cus_paid",
+        "status": "active",
+        "current_period_end": PERIOD_END,
+        "cancel_at_period_end": False,
+        "metadata": {"user_id": "user_payer", "plan": "pro_monthly"},
+    }
+    body = _forged_active_body(customer="cus_victim", sub_id="sub_paid")
+    body["data"]["object"]["metadata"] = {"user_id": "user_victim"}
+
+    with patch("routes.subscription.db", mock_db), patch(
+        "routes.subscription.stripe_sdk.Subscription.retrieve", return_value=retrieved
+    ), TestClient(server.app) as client:
+        resp = client.post("/api/webhook/stripe-subscription", json=body)
+
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["applied"] is True
+    filt, update = mock_db.users.update_one.await_args.args
+    assert filt == {"user_id": "user_payer"}
+    written = update["$set"]
+    assert written["tier"] == "pro"
+    assert written["subscription.stripe_customer_id"] == "cus_paid"
+    assert written["subscription.stripe_subscription_id"] == "sub_paid"
+
+
+def test_event_body_user_id_does_not_grant_pro_when_stripe_has_no_metadata():
+    mock_db = _mock_db()
+    mock_db.users.find_one = AsyncMock(return_value=None)
+    retrieved = {
+        "id": "sub_paid",
+        "customer": "cus_paid",
+        "status": "active",
+        "current_period_end": PERIOD_END,
+        "cancel_at_period_end": False,
+    }
+    body = _forged_active_body(customer="cus_paid", sub_id="sub_paid")
+    body["data"]["object"]["metadata"] = {"user_id": "user_victim"}
+
+    with patch("routes.subscription.db", mock_db), patch(
+        "routes.subscription.stripe_sdk.Subscription.retrieve", return_value=retrieved
+    ), TestClient(server.app) as client:
+        resp = client.post("/api/webhook/stripe-subscription", json=body)
+
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["applied"] is False
+    mock_db.users.find_one.assert_awaited_once_with(
+        {"subscription.stripe_customer_id": "cus_paid"}, {"_id": 0}
+    )
+    mock_db.users.update_one.assert_not_called()
+
+
 def test_bad_json_still_returns_400():
     mock_db = _mock_db()
     with patch("routes.subscription.db", mock_db), TestClient(server.app) as client:
