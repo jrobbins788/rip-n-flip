@@ -129,6 +129,57 @@ def test_orphaned_claim_older_than_hold_is_released():
     assert decision == "active"
 
 
+def test_failed_delayed_payment_returns_the_listing_to_active():
+    """Klarna/Afterpay/Affirm can finish Checkout and then fail.
+
+    The session stays complete and unpaid, which used to hold the card forever.
+    """
+    decision = decide_pending_listing(
+        pending_since=_iso(-timedelta(hours=25)),
+        transactions=[{
+            "session_id": "cs_klarna",
+            "payment_status": "pending",
+            "created_at": _iso(-timedelta(hours=25)),
+        }],
+        session_states={"cs_klarna": ("complete", "unpaid")},
+        intent_states={"cs_klarna": "canceled"},
+        has_open_trade=False,
+        now=NOW,
+    )
+    assert decision == "active"
+
+
+def test_processing_delayed_payment_keeps_the_hold():
+    decision = decide_pending_listing(
+        pending_since=_iso(-timedelta(hours=25)),
+        transactions=[{
+            "session_id": "cs_klarna",
+            "payment_status": "pending",
+            "created_at": _iso(-timedelta(hours=25)),
+        }],
+        session_states={"cs_klarna": ("complete", "unpaid")},
+        intent_states={"cs_klarna": "processing"},
+        has_open_trade=False,
+        now=NOW,
+    )
+    assert decision == "pending"
+
+
+def test_complete_unpaid_without_intent_status_keeps_the_hold():
+    decision = decide_pending_listing(
+        pending_since=_iso(-timedelta(hours=25)),
+        transactions=[{
+            "session_id": "cs_klarna",
+            "payment_status": "pending",
+            "created_at": _iso(-timedelta(hours=25)),
+        }],
+        session_states={"cs_klarna": ("complete", "unpaid")},
+        has_open_trade=False,
+        now=NOW,
+    )
+    assert decision == "pending"
+
+
 def test_fresh_claim_without_a_transaction_is_kept():
     decision = decide_pending_listing(
         pending_since=_iso(-timedelta(seconds=5)),
@@ -277,6 +328,45 @@ async def test_reconcile_puts_expired_checkout_back_on_sale():
     assert db.listings.docs[0]["status"] == "active"
     assert "pending_since" not in db.listings.docs[0]
     assert db.payment_transactions.docs[0]["payment_status"] == "expired"
+
+
+@pytest.mark.asyncio
+async def test_reconcile_releases_a_failed_delayed_payment():
+    db = _DB()
+    _seed_abandoned(db)
+
+    def retrieve(_session_id):
+        return {
+            "status": "complete",
+            "payment_status": "unpaid",
+            "payment_intent": {"id": "pi_failed", "status": "requires_payment_method"},
+        }
+
+    changed = await reconcile_abandoned_checkouts(db, retrieve, now=NOW)
+
+    assert changed == ["listing_abandoned"]
+    assert db.listings.docs[0]["status"] == "active"
+    assert db.payment_transactions.docs[0]["payment_status"] == "expired"
+
+
+@pytest.mark.asyncio
+async def test_reconcile_keeps_a_processing_delayed_payment():
+    db = _DB()
+    _seed_abandoned(db)
+
+    def retrieve(_session_id):
+        return {
+            "status": "complete",
+            "payment_status": "unpaid",
+            "payment_intent": {"id": "pi_open", "status": "processing"},
+        }
+
+    changed = await reconcile_abandoned_checkouts(db, retrieve, now=NOW)
+
+    assert changed == []
+    assert db.listings.docs[0]["status"] == "pending"
+    assert db.payment_transactions.docs[0]["payment_status"] == "pending"
+    assert db.payment_transactions.docs[0]["hold_recheck_after"]
 
 
 @pytest.mark.asyncio

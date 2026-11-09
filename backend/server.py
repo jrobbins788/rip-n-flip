@@ -5,7 +5,13 @@ import io
 import base64
 from dotenv import load_dotenv
 from cors_config import install_cors
-from checkout_holds import reconcile_abandoned_checkouts
+from checkout_holds import (
+    delayed_payment_failed,
+    payment_intent_id,
+    payment_intent_status,
+    reconcile_abandoned_checkouts,
+    release_failed_checkout_hold,
+)
 from motor.motor_asyncio import AsyncIOMotorClient
 from services.db_guard import mongo_client_kwargs
 import os
@@ -1809,7 +1815,12 @@ def _sale_identity(listing: dict) -> tuple:
 
 
 def _retrieve_marketplace_session(session_id: str):
-    return stripe_sdk.checkout.Session.retrieve(session_id)
+    # Expand the PaymentIntent so a finished-but-failed Klarna/Afterpay/Affirm
+    # session can be told apart from one whose money is still in flight.
+    return stripe_sdk.checkout.Session.retrieve(
+        session_id,
+        expand=["payment_intent"],
+    )
 
 
 async def _reconcile_checkout_holds() -> None:
@@ -2008,7 +2019,10 @@ async def stripe_webhook(request: Request):
         raise HTTPException(status_code=503, detail="stripe_not_configured")
 
     try:
-        session = stripe_sdk.checkout.Session.retrieve(session_id)
+        session = stripe_sdk.checkout.Session.retrieve(
+            session_id,
+            expand=["payment_intent"],
+        )
     except Exception as e:
         logger.warning(f"Marketplace webhook could not retrieve session {session_id}: {e}")
         # A missing session is permanent. A timeout or 5xx must be retried by Stripe,
@@ -2019,25 +2033,59 @@ async def stripe_webhook(request: Request):
             raise HTTPException(status_code=400, detail="unknown_session")
         raise HTTPException(status_code=503, detail="stripe_unavailable")
 
-    payment_status = session.get("payment_status") if hasattr(session, "get") else None
-    metadata = session.get("metadata") if hasattr(session, "get") else None
-    metadata_listing_id = metadata.get("listing_id") if hasattr(metadata, "get") else None
+    def _field(obj, key):
+        if obj is None:
+            return None
+        getter = getattr(obj, "get", None)
+        if callable(getter):
+            return getter(key)
+        return getattr(obj, key, None)
+
+    payment_status = _field(session, "payment_status")
+    session_status = _field(session, "status")
+    metadata = _field(session, "metadata")
+    metadata_listing_id = _field(metadata, "listing_id")
 
     transaction = await db.payment_transactions.find_one({"session_id": session_id}, {"_id": 0})
     listing_id = listing_id_to_mark_sold(transaction, payment_status, metadata_listing_id)
-    if not listing_id:
-        return {"status": "ignored", "payment_status": payment_status}
-
-    if transaction.get("payment_status") != "paid":
-        await db.payment_transactions.update_one(
-            {"session_id": session_id},
-            {"$set": {"payment_status": "paid"}},
+    if listing_id:
+        if transaction.get("payment_status") != "paid":
+            await db.payment_transactions.update_one(
+                {"session_id": session_id},
+                {"$set": {"payment_status": "paid"}},
+            )
+        await db.listings.update_one(
+            {"listing_id": listing_id},
+            {"$set": {"status": "sold"}},
         )
-    await db.listings.update_one(
-        {"listing_id": listing_id},
-        {"$set": {"status": "sold"}},
-    )
-    return {"status": "success"}
+        return {"status": "success"}
+
+    # Delayed methods (Klarna, Afterpay, Affirm) finish Checkout with
+    # status=complete and payment_status=unpaid. A failed PaymentIntent never
+    # expires the session, so the listing would stay pending forever.
+    intent_status = payment_intent_status(session)
+    if intent_status is None and session_status == "complete" and payment_status != "paid":
+        pi_id = payment_intent_id(session)
+        if pi_id:
+            try:
+                intent = stripe_sdk.PaymentIntent.retrieve(pi_id)
+            except Exception as e:
+                logger.warning(f"Marketplace webhook could not retrieve payment intent {pi_id}: {e}")
+                status = getattr(e, "http_status", None)
+                code = getattr(e, "code", None)
+                if status == 404 or code == "resource_missing":
+                    intent_status = None
+                else:
+                    raise HTTPException(status_code=503, detail="stripe_unavailable")
+            else:
+                intent_status = _field(intent, "status")
+                if not isinstance(intent_status, str):
+                    intent_status = None
+    if transaction and delayed_payment_failed(session_status, payment_status, intent_status):
+        await release_failed_checkout_hold(db, session_id=session_id, transaction=transaction)
+        return {"status": "released", "payment_status": payment_status}
+
+    return {"status": "ignored", "payment_status": payment_status}
 
 @api_router.get("/my-transactions")
 async def get_my_transactions(request: Request):

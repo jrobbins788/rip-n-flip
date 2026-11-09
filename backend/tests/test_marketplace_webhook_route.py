@@ -106,7 +106,7 @@ class _StripeDown(Exception):
 def test_unknown_session_does_not_update_listings():
     mock_db = _mock_db()
 
-    def _boom(session_id):
+    def _boom(session_id, **_kwargs):
         raise _MissingSession(f"no such session {session_id}")
 
     with patch("server.db", mock_db), patch.object(
@@ -153,6 +153,133 @@ def test_stripe_outage_does_not_mark_sold_and_asks_for_retry():
     assert resp.status_code == 503
     mock_db.listings.update_one.assert_not_called()
     mock_db.payment_transactions.update_one.assert_not_called()
+
+
+def _txn_lookup(transaction):
+    async def find_txn(query, projection=None):
+        session_id = query.get("session_id")
+        if session_id == transaction["session_id"]:
+            return transaction
+        return None
+
+    return find_txn
+
+
+def test_failed_delayed_payment_puts_the_listing_back_on_sale():
+    mock_db = _mock_db()
+    transaction = {
+        "session_id": "cs_test_klarna",
+        "listing_id": "listing_real",
+        "payment_status": "pending",
+        "created_at": "2026-11-01T00:00:00+00:00",
+    }
+    mock_db.payment_transactions.find_one = _txn_lookup(transaction)
+    mock_db.trades.find_one = AsyncMock(return_value=None)
+    failed = {
+        "status": "complete",
+        "payment_status": "unpaid",
+        "payment_intent": {"id": "pi_failed", "status": "canceled"},
+        "metadata": {"listing_id": "listing_real"},
+    }
+
+    with patch("server.db", mock_db), patch.object(
+        server.stripe_sdk.checkout.Session, "retrieve", return_value=failed
+    ), patch.object(
+        server.stripe_sdk.PaymentIntent, "retrieve", side_effect=AssertionError("intent is already expanded")
+    ), TestClient(server.app) as client:
+        resp = client.post(
+            "/api/webhook/stripe",
+            json={
+                "type": "checkout.session.async_payment_failed",
+                "data": {
+                    "object": {
+                        "id": "cs_test_klarna",
+                        "payment_status": "paid",
+                        "metadata": {"listing_id": "listing_victim"},
+                    }
+                },
+            },
+        )
+
+    assert resp.status_code == 200
+    assert resp.json()["status"] == "released"
+    mock_db.listings.update_one.assert_awaited_once_with(
+        {"listing_id": "listing_real", "status": "pending"},
+        {"$set": {"status": "active"}, "$unset": {"pending_since": ""}},
+    )
+    mock_db.payment_transactions.update_one.assert_awaited_once_with(
+        {"session_id": "cs_test_klarna", "payment_status": {"$nin": ["paid"]}},
+        {"$set": {"payment_status": "failed", "status": "complete"}},
+    )
+
+
+def test_processing_delayed_payment_does_not_relist():
+    mock_db = _mock_db()
+    mock_db.payment_transactions.find_one = _txn_lookup({
+        "session_id": "cs_test_klarna",
+        "listing_id": "listing_real",
+        "payment_status": "pending",
+        "created_at": "2026-11-01T00:00:00+00:00",
+    })
+    processing = {
+        "status": "complete",
+        "payment_status": "unpaid",
+        "payment_intent": {"id": "pi_open", "status": "processing"},
+        "metadata": {"listing_id": "listing_real"},
+    }
+
+    with patch("server.db", mock_db), patch.object(
+        server.stripe_sdk.checkout.Session, "retrieve", return_value=processing
+    ), TestClient(server.app) as client:
+        resp = client.post(
+            "/api/webhook/stripe",
+            json={
+                "type": "checkout.session.async_payment_failed",
+                "data": {"object": {"id": "cs_test_klarna", "payment_status": "unpaid"}},
+            },
+        )
+
+    assert resp.status_code == 200
+    assert resp.json()["status"] == "ignored"
+    mock_db.listings.update_one.assert_not_called()
+
+
+def test_failed_delayed_payment_does_not_release_a_newer_checkout():
+    mock_db = _mock_db()
+    transaction = {
+        "session_id": "cs_test_klarna",
+        "listing_id": "listing_real",
+        "payment_status": "pending",
+        "created_at": "2026-11-01T00:00:00+00:00",
+    }
+
+    async def find_txn(query, projection=None):
+        if query.get("session_id") == transaction["session_id"]:
+            return transaction
+        return {"session_id": "cs_test_newer", "payment_status": "pending"}
+
+    mock_db.payment_transactions.find_one = find_txn
+    mock_db.trades.find_one = AsyncMock(return_value=None)
+    failed = {
+        "status": "complete",
+        "payment_status": "unpaid",
+        "payment_intent": {"id": "pi_failed", "status": "canceled"},
+    }
+
+    with patch("server.db", mock_db), patch.object(
+        server.stripe_sdk.checkout.Session, "retrieve", return_value=failed
+    ), TestClient(server.app) as client:
+        resp = client.post(
+            "/api/webhook/stripe",
+            json={
+                "type": "checkout.session.async_payment_failed",
+                "data": {"object": {"id": "cs_test_klarna"}},
+            },
+        )
+
+    assert resp.status_code == 200
+    assert resp.json()["status"] == "released"
+    mock_db.listings.update_one.assert_not_called()
 
 
 def test_non_checkout_event_is_ignored():
