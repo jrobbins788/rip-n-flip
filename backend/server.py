@@ -1476,6 +1476,34 @@ class ListFromPullRequest(BaseModel):
     image_url: Optional[str] = None
 
 
+_REMOVED_CARD = "This card was removed from the seller's binder and is no longer for sale."
+_CHECKOUT_BLOCK = (
+    "This card is in an active checkout and can't be removed until that sale finishes or expires"
+)
+
+
+async def _all_rows(cursor) -> list:
+    """Read every row. Motor cursors iterate; the unit-test cursor only has to_list."""
+    if hasattr(cursor, "__aiter__"):
+        return [row async for row in cursor]
+    return await cursor.to_list(10**9)
+
+
+async def _pull_backs_listing(listing: dict) -> bool:
+    """A binder listing is sellable only while its pull still points at it.
+
+    Manual listings have no from_pull_id and stay sellable.
+    """
+    pull_id = listing.get("from_pull_id")
+    if not isinstance(pull_id, str) or not pull_id:
+        return True
+    pull = await db.case_pulls.find_one(
+        {"pull_id": pull_id},
+        {"_id": 0, "listed_listing_id": 1},
+    )
+    return bool(pull) and pull.get("listed_listing_id") == listing.get("listing_id")
+
+
 @api_router.post("/listings/from-pull")
 async def listings_from_pull(payload: ListFromPullRequest, request: Request):
     """One-tap list-from-binder: takes a pull's card data and creates a marketplace listing."""
@@ -1526,7 +1554,9 @@ async def listings_from_pull(payload: ListFromPullRequest, request: Request):
         "card_type": "Single",
         "image_url": image_url,
         "condition": payload.condition,
-        "status": "active",
+        # Stay off the marketplace until the pull is confirmed still here.
+        # A delete that lands during insert must not leave a buyable card.
+        "status": "provisioning",
         "from_pull_id": payload.pull_id,
         "created_at": datetime.now(timezone.utc).isoformat(),
     }
@@ -1555,7 +1585,56 @@ async def listings_from_pull(payload: ListFromPullRequest, request: Request):
             {"$unset": {"listed_listing_id": ""}, "$set": {"status": "in_collection"}},
         )
         raise
+
+    async def _drop_unpublished() -> None:
+        await db.listings.delete_one({"listing_id": listing_id, "status": "provisioning"})
+        await db.listings.delete_one({"listing_id": listing_id, "status": "active"})
+
+    still_there = await db.case_pulls.find_one(
+        {
+            "pull_id": payload.pull_id,
+            "user_id": user["user_id"],
+            "listed_listing_id": listing_id,
+        },
+        {"_id": 0, "pull_id": 1},
+    )
+    if not still_there:
+        await _drop_unpublished()
+        raise HTTPException(status_code=400, detail="This pull is no longer in your binder")
+
+    published = await db.listings.update_one(
+        {"listing_id": listing_id, "status": "provisioning"},
+        {"$set": {"status": "active"}},
+    )
+    if published.modified_count != 1:
+        await _drop_unpublished()
+        await db.case_pulls.update_one(
+            {"pull_id": payload.pull_id, "listed_listing_id": listing_id},
+            {"$unset": {"listed_listing_id": ""}, "$set": {"status": "in_collection"}},
+        )
+        raise HTTPException(status_code=409, detail="This pull is no longer in your binder")
+
+    # The binder delete can remove the pull after the check above and before
+    # this read. Take the listing back down unless a buyer already claimed it.
+    still_there = await db.case_pulls.find_one(
+        {
+            "pull_id": payload.pull_id,
+            "user_id": user["user_id"],
+            "listed_listing_id": listing_id,
+        },
+        {"_id": 0, "pull_id": 1},
+    )
+    if not still_there:
+        removed = await db.listings.delete_one({"listing_id": listing_id, "status": "active"})
+        if getattr(removed, "deleted_count", 0) != 1:
+            await db.listings.delete_one({"listing_id": listing_id, "status": "provisioning"})
+        raise HTTPException(
+            status_code=400,
+            detail="This pull was removed while it was being listed",
+        )
+
     listing_doc.pop("_id", None)
+    listing_doc["status"] = "active"
     return listing_doc
 
 
@@ -1835,6 +1914,12 @@ async def create_checkout(checkout_data: CheckoutRequest, request: Request):
     if listing["status"] != "active":
         raise HTTPException(status_code=400, detail="Listing is not available")
 
+    if not await _pull_backs_listing(listing):
+        await db.listings.delete_one(
+            {"listing_id": checkout_data.listing_id, "status": "active"},
+        )
+        raise HTTPException(status_code=409, detail=_REMOVED_CARD)
+
     # Claim the listing before talking to Stripe. Two buyers used to both
     # pass the status check, both pay, and one card was sold twice.
     # The price and card are read before this claim. A seller edit can commit
@@ -1858,6 +1943,17 @@ async def create_checkout(checkout_data: CheckoutRequest, request: Request):
             status_code=409,
             detail="This listing changed while checkout was starting. Refresh and try again.",
         )
+    if not await _pull_backs_listing(claimed):
+        # No Stripe session exists yet. Drop the hold instead of putting a
+        # removed card back on the market.
+        await db.listings.delete_one(
+            {
+                "listing_id": checkout_data.listing_id,
+                "status": "pending",
+                "pending_since": pending_since,
+            },
+        )
+        raise HTTPException(status_code=409, detail=_REMOVED_CARD)
     listing = claimed
 
     # Calculate total with platform fee from the card that was actually claimed.
@@ -2677,12 +2773,19 @@ async def trade_initiate(payload: TradeInitiate, request: Request):
     if not seller_tag:
         raise HTTPException(status_code=400, detail="Seller hasn't set a Cash App tag yet")
 
+    if not await _pull_backs_listing(listing):
+        await db.listings.delete_one(
+            {"listing_id": payload.listing_id, "status": "active"},
+        )
+        raise HTTPException(status_code=409, detail=_REMOVED_CARD)
+
     # Two buyers can both read status=active before either write lands.
     # Only a conditional claim may take the card off the market. pending_claim
     # changes on every attempt, so a second writer cannot look like a no-op.
+    claim_token = uuid.uuid4().hex
     claim = await db.listings.update_one(
         {"listing_id": payload.listing_id, "status": "active"},
-        {"$set": {"status": "pending", "pending_claim": uuid.uuid4().hex}},
+        {"$set": {"status": "pending", "pending_claim": claim_token}},
     )
     if claim.modified_count != 1:
         raise HTTPException(status_code=400, detail="Listing not available")
@@ -2690,6 +2793,15 @@ async def trade_initiate(payload: TradeInitiate, request: Request):
     fresh = await db.listings.find_one({"listing_id": payload.listing_id}, {"_id": 0})
     if fresh:
         listing = fresh
+    if not await _pull_backs_listing(listing):
+        await db.listings.delete_one(
+            {
+                "listing_id": payload.listing_id,
+                "status": "pending",
+                "pending_claim": claim_token,
+            },
+        )
+        raise HTTPException(status_code=409, detail=_REMOVED_CARD)
 
     base_price = float(listing["price"])
     platform_fee = round(base_price * (PLATFORM_FEE_PERCENT / 100), 2)
@@ -3508,6 +3620,8 @@ async def _withdraw_active_listing(listing_id: Optional[str]) -> None:
 
     Pending checkouts are rejected so a buyer is not charged for a card that
     was just removed from the binder. Sold listings are kept as the sale record.
+    A listing still being published (provisioning) is not for sale yet and is
+    removed with the pull.
     """
     if not listing_id:
         return
@@ -3517,20 +3631,47 @@ async def _withdraw_active_listing(listing_id: Optional[str]) -> None:
     if not listing:
         return
     if listing.get("status") == "pending":
-        raise HTTPException(
-            status_code=409,
-            detail="This card is in an active checkout and can't be removed until that sale finishes or expires",
-        )
-    if listing.get("status") != "active":
+        raise HTTPException(status_code=409, detail=_CHECKOUT_BLOCK)
+    if listing.get("status") not in ("active", "provisioning"):
         return
-    result = await db.listings.delete_one({"listing_id": listing_id, "status": "active"})
+    result = await db.listings.delete_one(
+        {"listing_id": listing_id, "status": listing["status"]},
+    )
     if result.deleted_count == 0:
         fresh = await db.listings.find_one({"listing_id": listing_id}, {"_id": 0, "status": 1})
         if fresh and fresh.get("status") == "pending":
-            raise HTTPException(
-                status_code=409,
-                detail="This card is in an active checkout and can't be removed until that sale finishes or expires",
+            raise HTTPException(status_code=409, detail=_CHECKOUT_BLOCK)
+
+
+async def _take_down_pull_listings(pull_id: str, *, block_on_pending: bool) -> None:
+    """Remove live listings created from this pull.
+
+    The pull's listed_listing_id can be empty while the listing row already
+    exists, or the other way around, when list and delete overlap.
+    """
+    if not isinstance(pull_id, str) or not pull_id:
+        return
+    for status in ("active", "provisioning"):
+        listing = await db.listings.find_one(
+            {"from_pull_id": pull_id, "status": status},
+            {"_id": 0, "listing_id": 1},
+        )
+        if not listing:
+            continue
+        if block_on_pending:
+            await _withdraw_active_listing(listing["listing_id"])
+        else:
+            await db.listings.delete_one(
+                {"listing_id": listing["listing_id"], "status": status},
             )
+    if not block_on_pending:
+        return
+    pending = await db.listings.find_one(
+        {"from_pull_id": pull_id, "status": "pending"},
+        {"_id": 0, "listing_id": 1},
+    )
+    if pending:
+        raise HTTPException(status_code=409, detail=_CHECKOUT_BLOCK)
 
 
 @api_router.delete("/case/packs/{case_pack_id}")
@@ -3558,8 +3699,19 @@ async def case_delete_pack(case_pack_id: str, request: Request):
         listing_id = pull.get("listed_listing_id")
         if listing_id:
             await db.listings.delete_one({"listing_id": listing_id, "status": "active"})
+    # A list request can publish a card after the snapshot above. Pull ids are
+    # stable, so take down every live listing that still names one of them.
+    backing = await _all_rows(db.case_pulls.find(
+        {"case_pack_id": case_pack_id},
+        {"_id": 0, "pull_id": 1},
+    ))
+    pull_ids = [row.get("pull_id") for row in backing if row.get("pull_id")]
+    for pull_id in pull_ids:
+        await _take_down_pull_listings(pull_id, block_on_pending=True)
     await db.case_packs.delete_one({"case_pack_id": case_pack_id})
     await db.case_pulls.delete_many({"case_pack_id": case_pack_id})
+    for pull_id in pull_ids:
+        await _take_down_pull_listings(pull_id, block_on_pending=False)
     return {"deleted": True}
 
 
@@ -3695,13 +3847,36 @@ async def case_delete_pull(pull_id: str, request: Request):
         raise HTTPException(status_code=404, detail="Pull not found")
     if pull["user_id"] != user["user_id"]:
         raise HTTPException(status_code=403, detail="Not your pull")
-    await _withdraw_active_listing(pull.get("listed_listing_id"))
-    await db.case_pulls.delete_one({"pull_id": pull_id})
-    await db.case_packs.update_one(
-        {"case_pack_id": pull["case_pack_id"]},
-        {"$inc": {"pulls_count": -1}}
+
+    # List and delete overlap. Drop whatever listing is linked now, then delete
+    # the pull only if that link did not change. A listing inserted after the
+    # first read is caught by the from_pull_id sweep.
+    for _attempt in range(4):
+        pull = await db.case_pulls.find_one({"pull_id": pull_id}, {"_id": 0})
+        if not pull:
+            raise HTTPException(status_code=404, detail="Pull not found")
+        if pull["user_id"] != user["user_id"]:
+            raise HTTPException(status_code=403, detail="Not your pull")
+        await _withdraw_active_listing(pull.get("listed_listing_id"))
+        await _take_down_pull_listings(pull_id, block_on_pending=True)
+        listed = pull.get("listed_listing_id")
+        delete_query = {"pull_id": pull_id, "user_id": user["user_id"]}
+        if listed:
+            delete_query["listed_listing_id"] = listed
+        else:
+            delete_query["listed_listing_id"] = None
+        removed = await db.case_pulls.delete_one(delete_query)
+        if removed.deleted_count == 1:
+            await _take_down_pull_listings(pull_id, block_on_pending=False)
+            await db.case_packs.update_one(
+                {"case_pack_id": pull["case_pack_id"]},
+                {"$inc": {"pulls_count": -1}}
+            )
+            return {"deleted": True}
+    raise HTTPException(
+        status_code=409,
+        detail="This card changed while it was being removed. Try again.",
     )
-    return {"deleted": True}
 
 
 @api_router.get("/case/stats")
