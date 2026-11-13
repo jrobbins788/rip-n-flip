@@ -283,6 +283,140 @@ def test_deleting_a_binder_withdraws_active_listings(db):
     assert db.listings.docs == []
 
 
+def test_deleting_a_pull_removes_a_listing_the_pull_record_does_not_point_at(db):
+    """List and delete can overlap: the listing exists, the pull link does not."""
+    db.case_pulls.docs.append(_pull())
+    db.listings.docs.append({
+        "listing_id": "listing_orphan",
+        "status": "active",
+        "from_pull_id": "pull_1",
+        "price": 40,
+    })
+
+    result = _run(server.case_delete_pull("pull_1", None))
+
+    assert result == {"deleted": True}
+    assert db.case_pulls.docs == []
+    assert db.listings.docs == []
+    assert db.case_packs.docs[0]["pulls_count"] == 0
+
+
+def test_listing_a_deleted_pull_does_not_leave_a_buyable_card(db):
+    db.case_pulls.docs.append(_pull())
+    original_insert = db.listings.insert_one
+
+    async def delete_pull_then_insert(doc):
+        db.case_pulls.docs.clear()
+        return await original_insert(doc)
+
+    db.listings.insert_one = delete_pull_then_insert
+
+    with pytest.raises(HTTPException) as raised:
+        _run(server.listings_from_pull(
+            server.ListFromPullRequest(pull_id="pull_1", price=40),
+            None,
+        ))
+
+    assert raised.value.status_code == 400
+    assert db.listings.docs == []
+
+
+def test_deleting_a_binder_removes_a_listing_the_snapshot_did_not_link(db):
+    db.case_pulls.docs.append(_pull())
+    db.listings.docs.append({
+        "listing_id": "listing_late",
+        "status": "active",
+        "from_pull_id": "pull_1",
+        "price": 55,
+    })
+
+    result = _run(server.case_delete_pack("binder_1", None))
+
+    assert result == {"deleted": True}
+    assert db.case_pulls.docs == []
+    assert db.listings.docs == []
+
+
+def test_binder_delete_keeps_a_pending_listing_the_snapshot_missed(db):
+    db.case_pulls.docs.append(_pull())
+    db.listings.docs.append({
+        "listing_id": "listing_hold",
+        "status": "pending",
+        "from_pull_id": "pull_1",
+        "price": 55,
+    })
+
+    with pytest.raises(HTTPException) as raised:
+        _run(server.case_delete_pack("binder_1", None))
+
+    assert raised.value.status_code == 409
+    assert len(db.case_packs.docs) == 1
+    assert len(db.case_pulls.docs) == 1
+    assert db.listings.docs[0]["status"] == "pending"
+
+
+def test_checkout_does_not_sell_a_listing_whose_pull_was_removed(db, monkeypatch):
+    db.listings.docs.append({
+        "listing_id": "listing_orphan",
+        "user_id": "seller",
+        "price": 25,
+        "status": "active",
+        "title": "CJ Stroud",
+        "from_pull_id": "pull_missing",
+    })
+
+    async def noop():
+        return None
+
+    async def buyer(_request):
+        return {"user_id": "buyer", "name": "Buyer"}
+
+    monkeypatch.setattr(server, "_reconcile_checkout_holds", noop)
+    monkeypatch.setattr(server, "require_auth", buyer)
+
+    with pytest.raises(HTTPException) as raised:
+        _run(server.create_checkout(
+            server.CheckoutRequest(
+                listing_id="listing_orphan",
+                origin_url="https://www.ripnflipapp.com",
+            ),
+            None,
+        ))
+
+    assert raised.value.status_code == 409
+    assert db.listings.docs == []
+
+
+def test_cash_app_trade_does_not_sell_a_listing_whose_pull_was_removed(db, monkeypatch):
+    db.listings.docs.append({
+        "listing_id": "listing_orphan",
+        "user_id": "seller",
+        "seller_name": "Seller",
+        "title": "CJ Stroud",
+        "price": 25,
+        "status": "active",
+        "from_pull_id": "pull_missing",
+    })
+    db.users = FakeCollection()
+    db.users.docs.append({"user_id": "seller", "name": "Seller", "cash_app_tag": "seller"})
+    db.trades = FakeCollection()
+
+    async def buyer(_request):
+        return {"user_id": "buyer", "name": "Buyer"}
+
+    monkeypatch.setattr(server, "require_auth", buyer)
+
+    with pytest.raises(HTTPException) as raised:
+        _run(server.trade_initiate(
+            server.TradeInitiate(listing_id="listing_orphan"),
+            None,
+        ))
+
+    assert raised.value.status_code == 409
+    assert db.listings.docs == []
+    assert db.trades.docs == []
+
+
 def test_deleting_a_binder_with_a_pending_sale_is_rejected(db):
     db.case_pulls.docs.append(_pull(listed_listing_id="listing_hold", status="listed"))
     db.listings.docs.append({"listing_id": "listing_hold", "status": "pending", "price": 25})
